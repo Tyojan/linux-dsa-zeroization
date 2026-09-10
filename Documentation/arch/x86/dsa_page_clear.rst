@@ -46,6 +46,25 @@ transfer limit or the DMA mapping limit use the CPU. The read-only
 pages successfully zeroed by DSA, after DMA unmapping. It can be used to
 verify that a workload actually uses the accelerator.
 
+``/sys/module/idxd_page_clear/parameters/cache_control`` controls the
+``IDXD_OP_FLAG_CC`` hint on Memory Fill descriptors. It defaults to false
+(CC=0, memory-directed writes). Set it to true for CC=1, cache-directed
+writes. These are placement hints, not guarantees of cache residency.
+The parameter is sampled once when preparing each descriptor; changing it
+does not modify descriptors already prepared or submitted. No queue rebind
+or module reload is needed::
+
+    echo 0 > /sys/module/idxd_page_clear/parameters/cache_control
+    # Run the benchmark with CC=0.
+    echo 1 > /sys/module/idxd_page_clear/parameters/cache_control
+    # Run the same benchmark with CC=1.
+
+The parameter reads back as ``N`` or ``Y``. It can also be set at module
+load time with ``modprobe idxd_page_clear cache_control=1``. Compare runs
+with the same ``min_pages`` and queue configuration, and record the delta
+of ``completed_pages`` for each run to check the amount of successful
+offload. Change the parameter between benchmark runs to avoid mixing modes.
+
 Execution and failure handling
 ------------------------------
 

@@ -15,6 +15,10 @@ static unsigned int min_pages = 1;
 module_param(min_pages, uint, 0644);
 MODULE_PARM_DESC(min_pages, "Minimum number of contiguous pages to offload");
 
+static bool cache_control;
+module_param(cache_control, bool, 0644);
+MODULE_PARM_DESC(cache_control, "Set the DSA cache-control hint on new fills (default: false)");
+
 static atomic64_t completed_pages = ATOMIC64_INIT(0);
 
 static int completed_pages_get(char *buffer, const struct kernel_param *kp)
@@ -67,6 +71,8 @@ static bool idxd_clear_pages(struct dsa_page_clear_ops *ops, void *addr,
 
 	desc->hw->opcode = DSA_OPCODE_MEMFILL;
 	desc->hw->flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (READ_ONCE(cache_control))
+		desc->hw->flags |= IDXD_OP_FLAG_CC;
 	desc->hw->pattern = 0;
 	desc->hw->dst_addr = dma;
 	desc->hw->xfer_size = len;
