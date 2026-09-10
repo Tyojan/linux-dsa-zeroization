@@ -5079,6 +5079,13 @@ static inline void clear_pages(void *addr, unsigned int npages)
 }
 #endif
 
+#ifndef clear_pages_with_dsa
+static inline void clear_pages_with_dsa(void *addr, unsigned int npages)
+{
+	clear_pages(addr, npages);
+}
+#endif
+
 #ifndef PROCESS_PAGES_NON_PREEMPT_BATCH
 #ifdef clear_pages
 /*

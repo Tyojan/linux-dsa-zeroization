@@ -32,6 +32,7 @@ obj-y				+= pat/
 CFLAGS_physaddr.o		:= -fno-stack-protector
 
 obj-$(CONFIG_X86_32)		+= pgtable_32.o iomap_32.o
+obj-$(CONFIG_X86_DSA_PAGE_CLEAR)	+= dsa.o
 
 obj-$(CONFIG_HUGETLB_PAGE)	+= hugetlbpage.o
 obj-$(CONFIG_PTDUMP)		+= dump_pagetables.o

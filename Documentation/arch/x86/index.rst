@@ -24,6 +24,7 @@ x86-specific Documentation
    intel-hfi
    shstk
    iommu
+   dsa_page_clear
    intel_txt
    amd-debugging
    amd-memory-encryption

@@ -167,7 +167,8 @@ int idxd_enqcmds(struct idxd_wq *wq, void __iomem *portal, const void *desc)
 	return rc;
 }
 
-int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
+static int __idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc,
+			      bool nowait)
 {
 	struct idxd_device *idxd = wq->idxd;
 	struct idxd_irq_entry *ie = NULL;
@@ -179,6 +180,8 @@ int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
 		return -EIO;
 
 	if (!percpu_ref_tryget_live(&wq->wq_active)) {
+		if (nowait)
+			return -ENXIO;
 		wait_for_completion(&wq->wq_resurrect);
 		if (!percpu_ref_tryget_live(&wq->wq_active))
 			return -ENXIO;
@@ -219,4 +222,16 @@ int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
 	percpu_ref_put(&wq->wq_active);
 	return 0;
 }
+
+int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
+{
+	return __idxd_submit_desc(wq, desc, false);
+}
 EXPORT_SYMBOL_NS_GPL(idxd_submit_desc, "IDXD");
+
+/* Unlike idxd_submit_desc(), never wait for a quiescing WQ to resurrect. */
+int idxd_submit_desc_nowait(struct idxd_wq *wq, struct idxd_desc *desc)
+{
+	return __idxd_submit_desc(wq, desc, true);
+}
+EXPORT_SYMBOL_NS_GPL(idxd_submit_desc_nowait, "IDXD");

@@ -109,6 +109,23 @@ static inline void clear_pages(void *addr, unsigned int npages)
 }
 #define clear_pages clear_pages
 
+#ifdef CONFIG_X86_DSA_PAGE_CLEAR
+bool dsa_clear_pages(void *addr, unsigned int npages);
+#endif
+
+/* Synchronous, like clear_pages(); the CPU handles unavailable DSA offload. */
+static inline void clear_pages_with_dsa(void *addr, unsigned int npages)
+{
+#ifdef CONFIG_X86_DSA_PAGE_CLEAR
+	if (dsa_clear_pages(addr, npages)) {
+		kmsan_unpoison_memory(addr, (size_t)npages * PAGE_SIZE);
+		return;
+	}
+#endif
+	clear_pages(addr, npages);
+}
+#define clear_pages_with_dsa clear_pages_with_dsa
+
 static inline void clear_page(void *addr)
 {
 	clear_pages(addr, 1);

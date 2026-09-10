@@ -807,6 +807,7 @@ void idxd_wq_flush_descs(struct idxd_wq *wq);
 
 /* submission */
 int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc);
+int idxd_submit_desc_nowait(struct idxd_wq *wq, struct idxd_desc *desc);
 struct idxd_desc *idxd_alloc_desc(struct idxd_wq *wq, enum idxd_op_type optype);
 int idxd_enqcmds(struct idxd_wq *wq, void __iomem *portal, const void *desc);
 

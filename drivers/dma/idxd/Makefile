@@ -10,3 +10,6 @@ idxd-$(CONFIG_INTEL_IDXD_PERFMON) += perfmon.o
 
 obj-$(CONFIG_INTEL_IDXD_COMPAT) += idxd_compat.o
 idxd_compat-y := compat.o
+
+obj-$(CONFIG_INTEL_IDXD_PAGE_CLEAR) += idxd_page_clear.o
+idxd_page_clear-y := page_clear.o

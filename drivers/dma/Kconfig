@@ -314,6 +314,26 @@ config INTEL_IDXD
 
 	  If unsure, say N.
 
+config X86_DSA_PAGE_CLEAR
+	bool
+	depends on X86_64
+
+config INTEL_IDXD_PAGE_CLEAR
+	tristate "Intel DSA page clearing on free (experimental)"
+	depends on INTEL_IDXD
+	depends on PREEMPT_COUNT && !PREEMPT_RT
+	select X86_DSA_PAGE_CLEAR
+	help
+	  Add synchronous DSA memory fill offload for init_on_free. Configure
+	  a dedicated kernel work queue with driver_name dsa_page_clear to
+	  use it. Unavailable offload and atomic contexts use CPU clearing.
+
+	  This experimental implementation polls for completion. A hardware
+	  timeout panics rather than reusing memory still accessible to DMA.
+	  See Documentation/arch/x86/dsa_page_clear.rst for setup and limits.
+
+	  If unsure, say N.
+
 config INTEL_IDXD_COMPAT
 	bool "Legacy behavior for idxd driver"
 	depends on PCI && X86_64

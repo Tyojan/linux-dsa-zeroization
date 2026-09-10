@@ -1217,12 +1217,17 @@ static inline bool should_skip_kasan_poison(struct page *page)
 	return page_kasan_tag(page) == KASAN_TAG_KERNEL;
 }
 
-static void clear_highpages_kasan_tagged(struct page *page, int numpages)
+static void clear_highpages_kasan_tagged(struct page *page, int numpages,
+				       bool try_dsa)
 {
 	/* s390's use of memset() could override KASAN redzones. */
 	kasan_disable_current();
 	if (!IS_ENABLED(CONFIG_HIGHMEM)) {
-		clear_pages(kasan_reset_tag(page_address(page)), numpages);
+		if (try_dsa)
+			clear_pages_with_dsa(kasan_reset_tag(page_address(page)),
+					     numpages);
+		else
+			clear_pages(kasan_reset_tag(page_address(page)), numpages);
 	} else {
 		int i;
 
@@ -1444,7 +1449,8 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 			init = false;
 	}
 	if (init)
-		clear_highpages_kasan_tagged(page, 1 << order);
+		clear_highpages_kasan_tagged(page, 1 << order,
+					   !(fpi_flags & FPI_NOLOCK));
 
 	/*
 	 * arch_free_page() can make the page's contents inaccessible.  s390
@@ -1866,7 +1872,7 @@ inline void post_alloc_hook(struct page *page, unsigned int order,
 	}
 	/* If memory is still not initialized, initialize it now. */
 	if (init)
-		clear_highpages_kasan_tagged(page, 1 << order);
+		clear_highpages_kasan_tagged(page, 1 << order, false);
 
 	set_page_owner(page, order, gfp_flags);
 	page_table_check_alloc(page, order);
