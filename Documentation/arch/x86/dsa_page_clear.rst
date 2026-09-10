@@ -24,7 +24,8 @@ Load ``idxd_page_clear`` and configure an unused DSA work queue with:
 * driver_name: ``dsa_page_clear``
 * name: a nonempty name, for example ``page_clear``
 * a group with an assigned engine, nonzero queue size and priority
-* Memory Fill enabled in the queue's operation configuration
+* Memory Fill supported by the device and, if per-queue operation
+  configuration is supported, enabled in the queue's operation configuration
 
 Bind the configured, enabled DSA parent device to ``idxd`` first, then bind
 the work queue to ``dsa_page_clear``. Only one page-clearing work queue may be

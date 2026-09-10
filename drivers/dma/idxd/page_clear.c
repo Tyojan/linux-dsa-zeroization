@@ -119,7 +119,13 @@ static int idxd_page_clear_probe(struct idxd_dev *idxd_dev)
 	mutex_lock(&wq->wq_lock);
 	if (!idxd_wq_driver_name_match(wq, dev) ||
 	    wq->idxd->data->type != IDXD_TYPE_DSA || !wq_dedicated(wq) ||
-	    !test_bit(DSA_OPCODE_MEMFILL, wq->opcap_bmap)) {
+	    !test_bit(DSA_OPCODE_MEMFILL, wq->idxd->opcap_bmap)) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+
+	/* The per-WQ bitmap exists only when WQCAP advertises op_config. */
+	if (wq->opcap_bmap && !test_bit(DSA_OPCODE_MEMFILL, wq->opcap_bmap)) {
 		ret = -ENODEV;
 		goto out_unlock;
 	}
