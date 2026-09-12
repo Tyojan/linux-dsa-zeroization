@@ -31,24 +31,21 @@ if [ ! -f "$DSA_SRC/arch/x86/include/asm/dsa.h" ]; then
     exit 1
 fi
 
-# This prototype uses the old, synchronous provider ABI. Do not accidentally
-# build it using the discarded kernel's symbol versions or header layout.
+# Safe deferred release requires the matching allocator and provider ABI.
 awk '
-    $2 == "dsa_register_page_clear" { provider = 1 }
+    $2 == "dsa_register_page_clear_v2" { provider = 1 }
     $2 == "idxd_submit_desc_nowait" { submit = 1 }
-    $2 == "dsa_free_pages_complete" { new_abi = 1 }
-    END { exit !(provider && submit && !new_abi) }
+    $2 == "dsa_free_pages_complete" { complete = 1 }
+    END { exit !(provider && submit && complete) }
 ' "$DSA_KDIR/Module.symvers" || {
-    echo "DSA_KDIR must contain the old kernel's full Module.symvers." >&2
+    echo "Build the safe-async kernel first; DSA_KDIR needs its full Module.symvers." >&2
     exit 1
 }
 # Force a fresh module link without split BTF tied to another vmlinux.
 # An empty override is intentional: CONFIG_DEBUG_INFO_BTF_MODULES=n is
 # still nonempty to Kbuild's ifdef and would not disable this step.
 rm -f "$DSA_MODULE_DIR/idxd_page_clear.ko"
-# The matching old build tree may have generated headers and Module.symvers
-# but no checked-out dsa.h.  Compile the module against its provider header
-# from this source tree while Kbuild uses DSA_KDIR for ABI symbol CRCs.
+# Compile against the matching provider header and allocator symbol CRCs.
 DSA_KCFLAGS="$DSA_KCFLAGS -I$DSA_SRC/arch/x86/include"
 make -C "$DSA_KDIR" -j"$DSA_JOBS" CC="$DSA_CC" KCFLAGS="$DSA_KCFLAGS" W=1 \
     M="$DSA_MODULE_DIR" CONFIG_DEBUG_INFO_BTF_MODULES= idxd_page_clear.ko

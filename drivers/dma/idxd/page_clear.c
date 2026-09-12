@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Synchronous init_on_free offload using a dedicated kernel DSA work queue. */
+/* Synchronous and deferred init_on_free using a dedicated kernel DSA WQ. */
 #include <linux/dma-mapping.h>
 #include <linux/kasan.h>
 #include <linux/ktime.h>
 #include <linux/list.h>
+#include <linux/log2.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/percpu.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
@@ -15,6 +17,7 @@
 #include "idxd.h"
 
 #define DSA_CLEAR_TIMEOUT_NS NSEC_PER_SEC
+#define DSA_CLEAR_TIMEOUT_POLL_INTERVAL 1024U
 #define DSA_CLEAR_MAX_BATCH 1024U
 
 static unsigned int min_pages = 1;
@@ -25,9 +28,13 @@ static bool cache_control;
 module_param(cache_control, bool, 0644);
 MODULE_PARM_DESC(cache_control, "Set the DSA cache-control hint on new fills (default: false)");
 
-static bool unsafe_async;
-module_param(unsafe_async, bool, 0644);
-MODULE_PARM_DESC(unsafe_async, "UNSAFE: return after queueing/submission; DMA may overwrite reused pages");
+static bool async_mode;
+module_param(async_mode, bool, 0644);
+MODULE_PARM_DESC(async_mode, "Defer allocator reuse until DMA completion (default: false)");
+
+static unsigned int max_pending_pages = 4096;
+module_param(max_pending_pages, uint, 0644);
+MODULE_PARM_DESC(max_pending_pages, "Maximum pages held for asynchronous zeroing; overflow uses CPU");
 
 static unsigned int batch_size = 1;
 static unsigned int batch_wait_us;
@@ -88,15 +95,15 @@ static const struct kernel_param_ops page_count_ops = {
 	.get = page_count_get,
 };
 module_param_cb(completed_pages, &page_count_ops, &completed_pages, 0444);
-MODULE_PARM_DESC(completed_pages, "Pages in DSA fills reporting success (not a reuse-safety guarantee)");
+MODULE_PARM_DESC(completed_pages, "Pages successfully zeroed by DSA and unmapped");
 module_param_cb(submitted_pages, &page_count_ops, &submitted_pages, 0444);
-MODULE_PARM_DESC(submitted_pages, "Pages submitted with unsafe early return");
+MODULE_PARM_DESC(submitted_pages, "Pages submitted for deferred allocator release");
 module_param_cb(pending_pages, &page_count_ops, &pending_pages, 0444);
-MODULE_PARM_DESC(pending_pages, "Pages in unsafe requests awaiting resource retirement; not isolated");
+MODULE_PARM_DESC(pending_pages, "Pages held outside allocator free lists, including admission reservations");
 module_param_cb(async_fallback_pages, &page_count_ops, &async_fallback_pages, 0444);
-MODULE_PARM_DESC(async_fallback_pages, "Pages rejected by unsafe mode and returned to CPU fallback");
+MODULE_PARM_DESC(async_fallback_pages, "Pages rejected by async mode, including below min_pages");
 module_param_cb(async_error_pages, &page_count_ops, &async_error_pages, 0444);
-MODULE_PARM_DESC(async_error_pages, "Pages in failed unsafe fills; no CPU repair is attempted");
+MODULE_PARM_DESC(async_error_pages, "Pages in failed deferred fills repaired by CPU before freeing");
 module_param_cb(batch_submissions, &page_count_ops, &batch_submissions, 0444);
 MODULE_PARM_DESC(batch_submissions, "Successfully submitted BATCH descriptors");
 module_param_cb(batched_descriptors, &page_count_ops, &batched_descriptors, 0444);
@@ -110,14 +117,109 @@ MODULE_PARM_DESC(peak_inflight_batches, "Maximum unreaped BATCH submissions sinc
 module_param_cb(overlapped_batch_submissions, &page_count_ops, &overlapped_batch_submissions, 0444);
 MODULE_PARM_DESC(overlapped_batch_submissions, "BATCH submissions while another BATCH was unreaped");
 
+static unsigned int latency_sample_every;
+static DEFINE_PER_CPU(unsigned int, latency_sample_seq);
+
+static int latency_sample_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int value;
+	int ret = kstrtouint(val, 0, &value);
+
+	if (ret)
+		return ret;
+	if (value && !is_power_of_2(value))
+		return -EINVAL;
+	WRITE_ONCE(*(unsigned int *)kp->arg, value);
+	return 0;
+}
+
+static const struct kernel_param_ops latency_sample_ops = {
+	.set = latency_sample_set,
+	.get = param_get_uint,
+};
+module_param_cb(latency_sample_every, &latency_sample_ops, &latency_sample_every, 0644);
+MODULE_PARM_DESC(latency_sample_every, "Sample every N direct synchronous submissions per CPU; 0 disables, N must be a power of two");
+
+#define DSA_LATENCY_STAT(name, description) \
+	static atomic64_t name = ATOMIC64_INIT(0); \
+	module_param_cb(name, &page_count_ops, &name, 0444); \
+	MODULE_PARM_DESC(name, description)
+
+DSA_LATENCY_STAT(latency_samples, "Completed sampled direct synchronous submissions");
+DSA_LATENCY_STAT(latency_sampled_pages, "Pages covered by latency samples");
+DSA_LATENCY_STAT(latency_total_ns, "Sum of sampled submit-entry to completion-observed times, ns");
+DSA_LATENCY_STAT(latency_submit_ns, "Sum of sampled time inside idxd_submit_desc_nowait, ns");
+DSA_LATENCY_STAT(latency_poll_loops, "Sum of unsuccessful completion polls in samples");
+DSA_LATENCY_STAT(latency_zero_polls, "Samples already complete at the first status check");
+DSA_LATENCY_STAT(latency_errors, "Samples with unsuccessful hardware completion status");
+DSA_LATENCY_STAT(latency_max_ns, "Maximum sampled total latency since module load, ns");
+DSA_LATENCY_STAT(latency_max_polls, "Maximum sampled unsuccessful polls since module load");
+
+/* Disjoint buckets with upper bounds 1, 2, 4, 8, 16, 32, 64 us, then >64 us. */
+static atomic64_t latency_buckets[8];
+
+static int latency_histogram_get(char *buffer, const struct kernel_param *kp)
+{
+	unsigned int i;
+	int len = 0;
+
+	for (i = 0; i < ARRAY_SIZE(latency_buckets); i++)
+		len += sysfs_emit_at(buffer, len, "%lld%c",
+				     atomic64_read(&latency_buckets[i]),
+				     i == ARRAY_SIZE(latency_buckets) - 1 ? '\n' : ' ');
+	return len;
+}
+
+static const struct kernel_param_ops latency_histogram_ops = {
+	.get = latency_histogram_get,
+};
+module_param_cb(latency_histogram, &latency_histogram_ops, NULL, 0444);
+MODULE_PARM_DESC(latency_histogram, "Disjoint sample counts: <=1us, (1,2], (2,4], (4,8], (8,16], (16,32], (32,64], >64us");
+
+static bool idxd_sample_latency(void)
+{
+	unsigned int every = READ_ONCE(latency_sample_every);
+
+	/* The provider calls us with preemption disabled. */
+	return every && !(this_cpu_inc_return(latency_sample_seq) & (every - 1));
+}
+
+static void idxd_latency_max(atomic64_t *counter, s64 value)
+{
+	s64 old = atomic64_read(counter);
+
+	while (value > old && !atomic64_try_cmpxchg(counter, &old, value))
+		cpu_relax();
+}
+
+static void idxd_record_latency(u64 total, u64 submit, u64 polls,
+				unsigned int npages, bool success)
+{
+	unsigned int bucket = 0;
+
+	while (bucket < ARRAY_SIZE(latency_buckets) - 1 && total > (1000ULL << bucket))
+		bucket++;
+	atomic64_add(total, &latency_total_ns);
+	atomic64_add(submit, &latency_submit_ns);
+	atomic64_add(polls, &latency_poll_loops);
+	atomic64_add(npages, &latency_sampled_pages);
+	if (!polls)
+		atomic64_inc(&latency_zero_polls);
+	if (!success)
+		atomic64_inc(&latency_errors);
+	idxd_latency_max(&latency_max_ns, total);
+	idxd_latency_max(&latency_max_polls, polls);
+	atomic64_inc(&latency_buckets[bucket]);
+	atomic64_inc(&latency_samples);
+}
+
 struct idxd_page_clear_request {
-	struct work_struct work;
+	struct page *page;
 	struct list_head node;
 	struct idxd_desc *desc;
 	dma_addr_t dma;
 	unsigned int npages;
 	u64 start;
-	bool early_return;
 	bool success;
 	bool done;
 };
@@ -142,6 +244,7 @@ struct idxd_page_clear {
 	spinlock_t pending_lock;
 	spinlock_t dispatch_lock;
 	struct list_head pending;
+	struct list_head running_direct;
 	unsigned int nr_pending;
 	struct work_struct batch_work;
 	struct idxd_page_batch *batches;
@@ -153,57 +256,67 @@ struct idxd_page_clear {
 	unsigned int capacity;
 };
 
-static void idxd_finish_unsafe_fill(struct idxd_page_clear_request *request,
-				   bool success)
+static void idxd_finish_deferred_fill(struct idxd_page_clear_request *request,
+				      bool success)
 {
 	struct idxd_desc *desc = request->desc;
 	struct idxd_wq *wq = desc->wq;
 	struct device *dev = &wq->idxd->pdev->dev;
 	unsigned int npages = request->npages;
+	struct page *page = request->page;
 
 	/* Recursive frees must not wait on the batch slot we are retiring. */
 	preempt_disable();
 	kasan_disable_current();
 	dma_unmap_page(dev, request->dma, (size_t)npages * PAGE_SIZE, DMA_FROM_DEVICE);
 	kasan_enable_current();
-	preempt_enable();
 	if (success)
 		atomic64_add(npages, &completed_pages);
 	else
 		atomic64_add(npages, &async_error_pages);
-	/* Never touch/clear/free the destination here: it may have a new owner. */
+	/* No DMA can touch these pages after unmapping, even on an error. */
+	dsa_free_pages_complete(page, ilog2(npages), success);
 	idxd_free_desc(wq, desc);
 	percpu_ref_put(&wq->wq_active);
 	atomic64_sub(npages, &pending_pages);
+	preempt_enable();
 }
 
-/* Retire DMA resources only. The allocator already owns the destination. */
-static void idxd_retire_unsafe_fill(struct work_struct *work)
+/* Reap ready direct fills without waiting behind an earlier slow request. */
+static void idxd_retire_direct_fills(struct idxd_page_clear *clear)
 {
-	struct idxd_page_clear_request *request =
-		container_of(work, struct idxd_page_clear_request, work);
-	struct idxd_desc *desc = request->desc;
-	u8 status;
+	struct idxd_page_clear_request *request, *next;
+	u64 now = ktime_get_mono_fast_ns();
+	LIST_HEAD(completed);
 
-	for (;;) {
-		status = READ_ONCE(desc->completion->status);
-		if (DSA_COMP_STATUS(status))
-			break;
-		if (ktime_get_mono_fast_ns() - request->start > DSA_CLEAR_TIMEOUT_NS)
-			panic("DSA unsafe fill timed out on %s; DMA resources still active",
-			      dev_name(wq_confdev(desc->wq)));
-		cpu_relax();
-		cond_resched();
+	preempt_disable();
+	spin_lock(&clear->pending_lock);
+	list_for_each_entry_safe(request, next, &clear->running_direct, node) {
+		u8 status = DSA_COMP_STATUS(READ_ONCE(request->desc->completion->status));
+
+		if (status) {
+			dma_rmb();
+			request->success = status == DSA_COMP_SUCCESS;
+			list_move_tail(&request->node, &completed);
+		} else if (now > request->start &&
+			   now - request->start > DSA_CLEAR_TIMEOUT_NS) {
+			panic("DSA deferred fill timed out on %s; pages still held",
+			      dev_name(wq_confdev(clear->wq)));
+		}
 	}
-	dma_rmb();
-	idxd_finish_unsafe_fill(request, DSA_COMP_STATUS(status) == DSA_COMP_SUCCESS);
+	spin_unlock(&clear->pending_lock);
+	list_for_each_entry_safe(request, next, &completed, node) {
+		list_del_init(&request->node);
+		idxd_finish_deferred_fill(request, request->success);
+	}
+	preempt_enable();
 }
 
 /*
  * Poll each submitted slot once, then try one new submission. Never wait for
  * hardware or the collection window while holding dispatch_lock. Each slot
  * owns its parent, child list and requests through completion and retirement.
- * Synchronous callers and the unsafe worker both drive this progress engine.
+ * Synchronous callers and the deferred worker both drive this progress engine.
  */
 static void idxd_flush_page_batch(struct idxd_page_clear *clear)
 {
@@ -289,7 +402,6 @@ static void idxd_flush_page_batch(struct idxd_page_clear *clear)
 
 			if (inflight > 1)
 				atomic64_inc(&overlapped_batch_submissions);
-			/* An old WQ's unsafe work can still drain during a new bind. */
 			while (inflight > peak &&
 			       !atomic64_try_cmpxchg(&peak_inflight_batches, &peak, inflight))
 				cpu_relax();
@@ -299,7 +411,7 @@ static void idxd_flush_page_batch(struct idxd_page_clear *clear)
 			atomic64_inc(&single_submissions);
 		}
 		list_for_each_entry(request, &batch->requests, node)
-			if (request->early_return)
+			if (request->page)
 				atomic64_add(request->npages, &submitted_pages);
 		list_add_tail(&batch->node, &clear->running_batches);
 	} else {
@@ -317,8 +429,8 @@ out_unlock:
 				DSA_COMP_SUCCESS;
 
 			list_del_init(&request->node);
-			if (request->early_return) {
-				idxd_finish_unsafe_fill(request, success);
+			if (request->page) {
+				idxd_finish_deferred_fill(request, success);
 			} else {
 				request->success = success;
 				/* Caller may recycle now; never access this request again. */
@@ -341,10 +453,12 @@ static void idxd_page_batch_work(struct work_struct *work)
 	bool busy;
 
 	for (;;) {
+		idxd_retire_direct_fills(clear);
 		idxd_flush_page_batch(clear);
 		spin_lock(&clear->dispatch_lock);
 		spin_lock(&clear->pending_lock);
-		busy = clear->nr_pending || clear->nr_active;
+		busy = clear->nr_pending || clear->nr_active ||
+			!list_empty(&clear->running_direct);
 		spin_unlock(&clear->pending_lock);
 		spin_unlock(&clear->dispatch_lock);
 		if (!busy)
@@ -354,8 +468,8 @@ static void idxd_page_batch_work(struct work_struct *work)
 	}
 }
 
-static bool idxd_clear_pages(struct dsa_page_clear_ops *ops, void *addr,
-			     unsigned int npages)
+static bool idxd_clear_pages_common(struct dsa_page_clear_ops *ops, void *addr,
+				    unsigned int npages, struct page *page)
 {
 	struct idxd_page_clear *clear = container_of(ops, struct idxd_page_clear, ops);
 	struct idxd_wq *wq = clear->wq;
@@ -364,10 +478,14 @@ static bool idxd_clear_pages(struct dsa_page_clear_ops *ops, void *addr,
 	struct idxd_desc *desc;
 	struct idxd_page_clear_request *request;
 	dma_addr_t dma;
+	unsigned int timeout_polls;
 	u64 start;
+	u64 sample_start = 0, sample_submit = 0, sample_polls = 0;
 	u8 status;
+	bool sampled;
 	bool cleared = false;
-	bool early_return = READ_ONCE(unsafe_async);
+	bool early_return = page != NULL;
+	bool reserved = false;
 	bool batching = READ_ONCE(batch_size) > 1 && clear->capacity > 1;
 
 	if (!npages || npages < READ_ONCE(min_pages) ||
@@ -375,6 +493,17 @@ static bool idxd_clear_pages(struct dsa_page_clear_ops *ops, void *addr,
 	    len > dma_max_mapping_size(dev) ||
 	    READ_ONCE(wq->state) != IDXD_WQ_ENABLED)
 		goto out_fallback;
+
+	if (early_return) {
+		s64 held = atomic64_read(&pending_pages);
+		unsigned int limit = READ_ONCE(max_pending_pages);
+
+		do {
+			if (held + npages > limit)
+				goto out_fallback;
+		} while (!atomic64_try_cmpxchg(&pending_pages, &held, held + npages));
+		reserved = true;
+	}
 
 	/* Hold the WQ live until both completion and DMA unmapping finish. */
 	if (!percpu_ref_tryget_live(&wq->wq_active))
@@ -405,21 +534,19 @@ static bool idxd_clear_pages(struct dsa_page_clear_ops *ops, void *addr,
 		request->desc = desc;
 		request->dma = dma;
 		request->npages = npages;
+		request->page = page;
 		request->start = ktime_get_mono_fast_ns();
 	}
 
 	if (batching) {
-		request->early_return = early_return;
 		request->done = false;
-		if (early_return)
-			atomic64_add(npages, &pending_pages);
 		spin_lock(&clear->pending_lock);
 		list_add_tail(&request->node, &clear->pending);
 		clear->nr_pending++;
 		spin_unlock(&clear->pending_lock);
 		if (early_return) {
 			queue_work(clear->retire_wq, &clear->batch_work);
-			/* Unsafe: the destination may be reused even before submission. */
+			/* The allocator retains these pages outside its free lists. */
 			return true;
 		}
 		/* Do not depend on a worker running while callers disable preemption. */
@@ -433,19 +560,21 @@ static bool idxd_clear_pages(struct dsa_page_clear_ops *ops, void *addr,
 		goto out_unmap;
 	}
 
+	sampled = !early_return && idxd_sample_latency();
+	if (sampled)
+		sample_start = ktime_get_mono_fast_ns();
 	if (idxd_submit_desc_nowait(wq, desc))
 		goto out_unmap;
+	if (sampled)
+		sample_submit = ktime_get_mono_fast_ns();
 	atomic64_inc(&single_submissions);
 
 	if (early_return) {
 		atomic64_add(npages, &submitted_pages);
-		atomic64_add(npages, &pending_pages);
-		queue_work(clear->retire_wq, &request->work);
-		/*
-		 * Deliberately violates the old synchronous provider contract.
-		 * The page may be reused BEFORE this DMA fill finishes. This is
-		 * an unsafe submission-cost experiment, not valid init_on_free.
-		 */
+		spin_lock(&clear->pending_lock);
+		list_add_tail(&request->node, &clear->running_direct);
+		spin_unlock(&clear->pending_lock);
+		queue_work(clear->retire_wq, &clear->batch_work);
 		return true;
 	}
 
@@ -454,17 +583,32 @@ static bool idxd_clear_pages(struct dsa_page_clear_ops *ops, void *addr,
 	 * Never return on timeout: DMA could still overwrite a reused page.
 	 */
 	start = ktime_get_mono_fast_ns();
+	timeout_polls = DSA_CLEAR_TIMEOUT_POLL_INTERVAL;
 	for (;;) {
 		status = READ_ONCE(desc->completion->status);
 		if (DSA_COMP_STATUS(status))
 			break;
-		if (ktime_get_mono_fast_ns() - start > DSA_CLEAR_TIMEOUT_NS)
-			panic("DSA page clear timed out on %s; DMA may still be active",
-			      dev_name(wq_confdev(wq)));
+		/* Poll completion every time, but amortize the clock read. */
+		if (!--timeout_polls) {
+			if (sampled)
+				sample_polls += DSA_CLEAR_TIMEOUT_POLL_INTERVAL;
+			if (ktime_get_mono_fast_ns() - start > DSA_CLEAR_TIMEOUT_NS)
+				panic("DSA page clear timed out on %s; DMA may still be active",
+				      dev_name(wq_confdev(wq)));
+			timeout_polls = DSA_CLEAR_TIMEOUT_POLL_INTERVAL;
+		}
 		cpu_relax();
 	}
 	dma_rmb();
 	cleared = DSA_COMP_STATUS(status) == DSA_COMP_SUCCESS;
+	if (sampled) {
+		u64 end = ktime_get_mono_fast_ns();
+
+		/* Reuse the timeout countdown instead of incrementing every poll. */
+		sample_polls += DSA_CLEAR_TIMEOUT_POLL_INTERVAL - timeout_polls;
+		idxd_record_latency(end - sample_start, sample_submit - sample_start,
+				    sample_polls, npages, cleared);
+	}
 	if (!cleared)
 		dev_warn_ratelimited(dev, "page clear failed: status %#x; using CPU\n",
 				     status);
@@ -479,9 +623,35 @@ out_desc:
 out_ref:
 	percpu_ref_put(&wq->wq_active);
 out_fallback:
+	if (reserved)
+		atomic64_sub(npages, &pending_pages);
 	if (early_return)
 		atomic64_add(npages, &async_fallback_pages);
 	return cleared;
+}
+
+static bool idxd_clear_pages(struct dsa_page_clear_ops *ops, void *addr,
+			     unsigned int npages)
+{
+	/* A rejected deferred request must use CPU, not retry synchronously. */
+	if (READ_ONCE(async_mode))
+		return false;
+	return idxd_clear_pages_common(ops, addr, npages, NULL);
+}
+
+static bool idxd_defer_pages(struct dsa_page_clear_ops *ops, struct page *page,
+			     unsigned int order)
+{
+	if (!READ_ONCE(async_mode))
+		return false;
+	return idxd_clear_pages_common(ops, page_address(page), 1U << order, page);
+}
+
+static void idxd_drain_pages(struct dsa_page_clear_ops *ops)
+{
+	struct idxd_page_clear *clear = container_of(ops, struct idxd_page_clear, ops);
+
+	flush_workqueue(clear->retire_wq);
 }
 
 static void idxd_free_page_batch(struct idxd_page_clear *clear)
@@ -514,6 +684,7 @@ static int idxd_alloc_page_batch(struct idxd_page_clear *clear)
 	spin_lock_init(&clear->pending_lock);
 	spin_lock_init(&clear->dispatch_lock);
 	INIT_LIST_HEAD(&clear->pending);
+	INIT_LIST_HEAD(&clear->running_direct);
 	INIT_LIST_HEAD(&clear->free_batches);
 	INIT_LIST_HEAD(&clear->running_batches);
 	INIT_WORK(&clear->batch_work, idxd_page_batch_work);
@@ -568,7 +739,7 @@ static int idxd_page_clear_probe(struct idxd_dev *idxd_dev)
 	struct device *dev = &idxd_dev->conf_dev;
 	struct idxd_wq *wq = idxd_dev_to_wq(idxd_dev);
 	struct idxd_page_clear *clear;
-	int ret, i;
+	int ret;
 
 	mutex_lock(&wq->wq_lock);
 	if (!idxd_wq_driver_name_match(wq, dev) ||
@@ -591,6 +762,8 @@ static int idxd_page_clear_probe(struct idxd_dev *idxd_dev)
 	}
 	clear->wq = wq;
 	clear->ops.clear = idxd_clear_pages;
+	clear->ops.defer = idxd_defer_pages;
+	clear->ops.drain = idxd_drain_pages;
 	wq->type = IDXD_WQT_KERNEL;
 	ret = idxd_drv_enable_wq(wq);
 	if (ret)
@@ -601,19 +774,17 @@ static int idxd_page_clear_probe(struct idxd_dev *idxd_dev)
 		ret = -ENOMEM;
 		goto out_disable;
 	}
-	for (i = 0; i < wq->num_descs; i++)
-		INIT_WORK(&clear->requests[i].work, idxd_retire_unsafe_fill);
 	ret = idxd_alloc_page_batch(clear);
 	if (ret)
 		goto out_requests;
-	clear->retire_wq = alloc_workqueue("dsa_unsafe_retire",
+	clear->retire_wq = alloc_workqueue("dsa_page_retire",
 					 WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
 	if (!clear->retire_wq) {
 		ret = -ENOMEM;
 		goto out_batch;
 	}
 
-	ret = dsa_register_page_clear(&clear->ops);
+	ret = dsa_register_page_clear_v2(&clear->ops);
 	if (ret) {
 		destroy_workqueue(clear->retire_wq);
 		goto out_batch;
@@ -653,7 +824,7 @@ static void idxd_page_clear_remove(struct idxd_dev *idxd_dev)
 	/* Reset before unregister allows another queue to register its capacity. */
 	WRITE_ONCE(batch_capacity, 1);
 	WRITE_ONCE(batch_slots_active, 0);
-	dsa_unregister_page_clear(&clear->ops);
+	dsa_unregister_page_clear_v2(&clear->ops);
 	destroy_workqueue(clear->retire_wq);
 	idxd_free_page_batch(clear);
 	mutex_lock(&wq->wq_lock);
@@ -679,5 +850,5 @@ static struct idxd_device_driver idxd_page_clear_driver = {
 module_idxd_driver(idxd_page_clear_driver);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Intel DSA page clearing with synchronous and unsafe batched submission");
+MODULE_DESCRIPTION("Intel DSA page clearing with synchronous and safe deferred release");
 MODULE_IMPORT_NS("IDXD");

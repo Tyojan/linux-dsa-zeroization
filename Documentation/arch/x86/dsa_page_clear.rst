@@ -9,8 +9,9 @@ zeroing to Intel DSA. It does not change SLUB object clearing or
 synchronous wrapper: it tries a registered provider and otherwise calls the
 existing CPU ``clear_pages()`` implementation.
 
-The default synchronous mode honors this contract. The explicitly unsafe
-``unsafe_async`` experiment below deliberately violates it.
+Both modes preserve zero-before-reuse. The asynchronous mode uses a separate
+allocator ownership-transfer callback; it never returns early from the
+synchronous clearing callback.
 
 Configuration
 -------------
@@ -68,13 +69,13 @@ with the same ``min_pages`` and queue configuration, and record the delta
 of ``completed_pages`` for each run to check the amount of successful
 offload. Change the parameter between benchmark runs to avoid mixing modes.
 
-Batching in synchronous and unsafe modes
----------------------------------------
+Batching in synchronous and asynchronous modes
+---------------------------------------------
 
 ``batch_size`` under ``/sys/module/idxd_page_clear/parameters/`` sets the
 maximum number of MEMFILL descriptors in a batch. It accepts 1..1024 and
 defaults to 1, which uses the original direct submission path. It is
-independent of ``unsafe_async`` and can be changed without reloading the
+independent of ``async_mode`` and can be changed without reloading the
 module. Each child still represents one contiguous range from one free
 request; large ranges are not split into page-sized descriptors. Separate
 ranges can be noncontiguous.
@@ -141,27 +142,26 @@ child, or a failed child results in CPU clearing by that child's caller.
 Serial frees from a single thread cannot accumulate across calls: they
 produce single MEMFILLs, and a nonzero collection window adds latency.
 
-In unsafe mode, the callback returns after software queueing, potentially
-before hardware submission. The worker or a concurrent synchronous caller
-dispatches queued requests and retires resources after completion. The
-existing unsafe reuse race still applies. A submission rejected after the
-callback returned counts as ``async_error_pages``; CPU repair is no longer
-possible at that point. Mode and cache-control choices are retained per
-request. Batch size and collection window are sampled per dispatch, so a
-change applies to subsequent dispatches, including already queued requests.
+In asynchronous mode, the allocator transfers ownership after free
+preparation. The callback can return after software queueing, before hardware
+submission. The worker or a concurrent synchronous caller dispatches queued
+requests. After completion and DMA unmapping, successful pages are released
+to the allocator; errors and unexecuted children are zeroed by CPU first.
+Mode and cache-control choices are retained per request. Batch size and
+collection window are sampled per dispatch, including for queued requests.
 
 For example, on the target machine, as root::
 
     cd /sys/module/idxd_page_clear/parameters
     cat batch_capacity
-    echo 0 > unsafe_async
+    echo 0 > async_mode
     echo 16 > batch_size
     echo 0 > batch_wait_us
     # Run a concurrent allocation/free benchmark in synchronous mode.
     echo 2 > batch_wait_us
     # Repeat with a 2-us collection window.
-    echo 1 > unsafe_async
-    # Repeat the existing unsafe experiment with the same batch settings.
+    echo 1 > async_mode
+    # Repeat in safe asynchronous mode with the same batch settings.
 
 Use counter deltas between benchmark runs:
 
@@ -190,65 +190,71 @@ specification, sections 3.8 and 8.3.2
 
 To change the slot pool, reload the module and rebind the WQ, for example
 using ``modprobe idxd_page_clear batch_slots=8`` at load time. Only the
-page-clear module needs rebuilding for this change; the provider ABI and
-page allocator are unchanged. Keep the slot count fixed when comparing
+page-clear module needs rebuilding for subsequent driver changes once the
+safe-async kernel is installed. Keep the slot count fixed when comparing
 ``batch_size=1`` and ``batch_size=16`` so the number of available child
 descriptors is the same in both measurements.
 
-Unsafe early-return experiment with the old kernel
-------------------------------------------------
+Safe asynchronous release
+-------------------------
 
-This module-only prototype targets the synchronous provider ABI from commit
-``ef0fd3bebb0a``. It does not require the discarded async changes to the page
-allocator or a new kernel image. ``unsafe_async`` defaults to false::
+This version requires a new kernel **and** a matching module. The versioned
+``dsa_register_page_clear_v2`` interface prevents the previous unsafe module
+from loading into this kernel. The old ``async_mode`` parameter has been
+removed. Use ``async_mode`` (default false)::
 
-    echo 0 > /sys/module/idxd_page_clear/parameters/unsafe_async
-    # Normal synchronous mode.
-    echo 1 > /sys/module/idxd_page_clear/parameters/unsafe_async
-    # UNSAFE: return after software queueing (batch) or submission (direct).
+    echo 1 > /sys/module/idxd_page_clear/parameters/async_mode
 
-In unsafe mode, the freeing caller does not wait for completion. Pages are
-not isolated or retained: the old allocator can reuse them immediately.
-An outstanding DMA fill can overwrite another allocation, including its
-metadata. This can corrupt results or crash the machine. This is a timing
-experiment that discards init_on_free correctness, not an asynchronous
-implementation preserving zero-before-reuse.
+Free preparation checks the pages, tears down compound metadata and accounts
+for their release once. Eligible ``init_on_free`` requests then transfer the
+prepared pages to the provider. Their references remain zero, but they are
+on neither PCP nor buddy lists and are not counted as available free memory.
+The allocator cannot allocate or merge them while a request holds them.
+Preparation-only users, such as compaction's private lists, remain synchronous.
 
-A worker (or a synchronous batch dispatcher) checks completion to retire
-the descriptor and DMA mapping.
-Recycling either while hardware is still using it would invalidate later
-submissions. The worker does not verify destination contents, clear failed
-fills with the CPU, or free pages. Bounce-buffer unmapping itself can copy
-data into a destination already reused by another owner. There is no attempt
-to repair that race. Missing completion still uses the one-second panic
-timeout, which worker scheduling can delay.
+After completion is observed with the DMA read barrier and the destination
+is unmapped (including any bounce-buffer copy), the provider calls
+``dsa_free_pages_complete()`` exactly once. On failure, this clears the entire
+range using CPU before releasing it. The allocator finishes architecture
+hooks and uses ``FPI_PREPARED`` to publish pages without repeating accounting,
+compound teardown, poisoning or DSA submission. Completion may run before
+the original free call returns; the accepting path does not touch pages again.
 
-Queue exhaustion, mapping failure or rejected direct submission falls back
-to CPU clearing. Deferred batch submission failures are counted as errors.
-Compare counter deltas to distinguish actual offload from fallback:
+``max_pending_pages`` caps the pages retained by asynchronous requests
+(default 4096, or 16 MiB with 4-KiB pages). It includes admission reservations,
+software-queued requests and submitted requests until retirement completes.
+Descriptor exhaustion, this limit, mapping failure, rejected direct submission
+and ranges below ``min_pages`` use CPU clearing. Reducing the cap does not
+cancel accepted requests. Setting it to zero prevents new asynchronous work.
 
-* ``submitted_pages``: pages in accepted unsafe submissions.
-* ``pending_pages``: pages covered by unsafe requests, including those still
-  queued in software, whose resources have not been retired; these pages
-  are **not** protected from reuse.
-* ``async_fallback_pages``: pages rejected by the unsafe callback and left
-  to CPU fallback. This excludes frees bypassing the provider entirely,
-  for example atomic-context frees.
-* ``async_error_pages``: pages in unsafe fills reporting an error, including
-  unexecuted children and rejected deferred submissions.
-* ``completed_pages``: pages in fills reporting success, in either mode;
-  this does not guarantee that their next owner was not corrupted.
+Direct requests are submitted without waiting. One work item scans outstanding
+direct completions and batch slots; a slow request does not prevent retiring
+later completed requests. The worker still polls and uses CPU time, and its
+scheduling latency delays reuse. This is safe deferral, not a guarantee of
+lower hardware latency or better benchmark performance.
 
-Disable unsafe mode before changing experiments or unbinding, and observe
-the remaining resource retirements::
+* ``submitted_pages``: pages in accepted asynchronous hardware submissions.
+* ``pending_pages``: currently retained pages, including admission reservations.
+* ``async_fallback_pages``: pages rejected by the asynchronous callback,
+  including below-threshold requests. Frees bypassing the callback, for example
+  in atomic context, are excluded.
+* ``async_error_pages``: failed or unexecuted deferred fills repaired by CPU.
+* ``completed_pages``: pages successfully zeroed by DSA in either mode.
 
-    echo 0 > /sys/module/idxd_page_clear/parameters/unsafe_async
+To stop new asynchronous requests and observe the remainder draining::
+
+    echo 0 > /sys/module/idxd_page_clear/parameters/async_mode
     while [ "$(cat /sys/module/idxd_page_clear/parameters/pending_pages)" -ne 0 ]; do
         sleep 0.01
     done
 
-Removal stops new callbacks and drains retirement work before destroying
-the WQ. Switching the parameter does not cancel already-submitted DMA.
+Unregister stops new callbacks, waits for active callbacks under RCU, then
+drains all accepted requests before another provider can register. Memory
+offlining and system suspend/hibernate also pause submissions and drain before
+proceeding. KASAN/KMSAN configurations and active debug-pagealloc use the
+existing synchronous path. Atomic contexts and recursive frees use CPU.
+A missing hardware completion still causes a panic after the timeout; it
+never permits freeing pages while DMA may remain active.
 
 Building only the module on another NFS client
 ---------------------------------------------
@@ -264,8 +270,8 @@ the same path::
 
 The output is ``drivers/dma/idxd/idxd_page_clear.ko`` inside the shared
 source directory, ready for the separate installation script.
-``DSA_KDIR`` can select a different prepared build tree matching the old
-running kernel. Its configuration, generated headers and complete
+``DSA_KDIR`` can select a different prepared build tree matching the new
+safe-async kernel. Its configuration, generated headers and complete
 ``Module.symvers`` must match that kernel and its existing IDXD modules.
 ``DSA_CC`` (default ``gcc``) and ``DSA_JOBS`` override the compiler and
 parallelism.
@@ -273,39 +279,18 @@ parallelism.
 The script disables module BTF generation for this experiment. Split module
 BTF generated against a different ``vmlinux`` can fail validation even when
 the kernel release string is identical. Disabling BTF does not fix an ABI
-or symbol-CRC mismatch: the old kernel's build metadata is still required.
-Install only the resulting ``idxd_page_clear.ko`` with the old matching
-kernel and IDXD modules. Do not install the discarded kernel image or its
-IDXD modules. This source tree does not contain a recovered copy of the old
-kernel image; use the target's boot backup or another known-good build.
+or symbol-CRC mismatch: the matching safe-async kernel build metadata is
+required. For the first update, build the whole kernel on the TDX machine::
 
-Recovering the target after the discarded kernel install
--------------------------------------------------------
+    cd /home/sawa/TIFS/DSA_init_on_free/linux-dsa-main
+    make -j"$(nproc)"
+    make -s kernelrelease
 
-If the target reports module BTF validation failures, boot a known-good
-distribution kernel or recovery environment. Restore the boot files saved
-before the discarded kernel was installed, and remove its module overrides
-from depmod's search path. For the earlier install procedure, run on the
-target (replace the backup directory with the actual pre-update backup)::
-
-    KREL=7.3.0-rc2-dsa+
-    ls -d /var/backups/dsa-kernel-*
-    BOOT_BACKUP=/var/backups/dsa-kernel-YYYYMMDD-HHMMSS
-    sudo cp -a "$BOOT_BACKUP"/. /boot/
-    if [ -d "/lib/modules/$KREL/updates/dsa-async" ]; then
-        sudo mv "/lib/modules/$KREL/updates/dsa-async" \
-            "${BOOT_BACKUP}-discarded-modules"
-    fi
-    sudo depmod -a "$KREL"
-    sudo update-initramfs -u -k "$KREL"
-    sudo update-grub
-    sudo reboot
-
-This assumes the original matching modules remain installed outside the
-``updates/dsa-async`` override directory. Restoring only the kernel image
-while retaining the incompatible overrides is insufficient. If the original
-modules or boot backup are unavailable, recover them from the matching old
-build before installing the prototype.
+The tracked ``localversion.dsa-safe-async`` suffix distinguishes the new
+kernel from the former synchronous/unsafe kernel. Install its kernel image
+and matching modules using the separate installation script, then boot it
+with ``init_on_free=1``. Reloading only the module on the old kernel cannot
+provide safe asynchronous release. This build script never installs files.
 
 Execution and failure handling
 ------------------------------
@@ -333,6 +318,77 @@ returning and reusing the page in this case could allow delayed DMA to
 overwrite its next owner's data. Device faults or resets can trigger this
 case; there is no timeout recovery implementation yet.
 
+For direct synchronous MEMFILL submissions (``batch_size=1``), completion
+status is checked on every polling iteration, but the clock is read only
+at the start of the wait and after every 1024 unsuccessful polls. This
+reduces timeout-accounting overhead without delaying completion checks.
+The one-second timeout is detected at the next clock check; the extra
+delay is not a fixed wall-clock bound. Completion ordering, DMA unmapping,
+and the rule against returning with DMA still active are unchanged.
+Batch dispatch and asynchronous retirement also check for missing completion.
+
+Sampled synchronous latency
+---------------------------
+
+``latency_sample_every`` in the module's sysfs parameters enables diagnostic
+sampling of direct synchronous MEMFILL submissions. The module default is
+0 (disabled). A nonzero value must be a power of two: 1024 selects one in
+every 1024 eligible submission attempts on each CPU. CPU-local sequences
+avoid a shared atomic update on every submission. Their phases are not
+reset when changing the interval; this is periodic sampling, not a random
+sample. Batches, asynchronous requests, mapping failures and requests rejected
+before submission are not measured. Rejected submissions do not produce
+a latency sample either. A completed hardware error is sampled and counted
+separately as ``latency_errors``.
+
+For example, on the target machine as root::
+
+    cd /sys/module/idxd_page_clear/parameters
+    echo 0 > async_mode
+    echo 1 > batch_size
+    echo 8 > min_pages
+    echo 1 > cache_control
+    echo 1024 > latency_sample_every
+
+Three timestamps are read for each sample: just before the submission
+call, just after its successful return, and after observing completion and
+the DMA read barrier. ``latency_total_ns`` accumulates the first-to-last
+interval; ``latency_submit_ns`` accumulates time in the submission call.
+Their difference includes the submission counter update, timeout setup and
+completion polling after submission returns. These are software-observed
+latencies, not device execution times; hardware can already be processing
+the fill before the submission call returns. Mapping/unmapping and the
+latency-statistic updates themselves are outside the measured interval.
+
+Read cumulative counters before and after each workload and use differences:
+
+* ``latency_samples``: number of sampled terminal completions.
+* ``latency_sampled_pages``: pages covered by those samples, including errors.
+* ``latency_total_ns`` and ``latency_submit_ns``: cumulative nanoseconds.
+  Divide their deltas by the sample count delta for means.
+* ``latency_poll_loops``: cumulative unsuccessful status checks. The count
+  reuses the timeout countdown, with no extra increment on every poll.
+* ``latency_zero_polls``: samples already complete at their first check.
+* ``latency_errors``: sampled completions reporting an error.
+* ``latency_max_ns`` and ``latency_max_polls``: maxima since module load,
+  not per-workload maxima; do not subtract them to compute a workload peak.
+* ``latency_histogram``: eight space-separated cumulative counts in disjoint
+  submit-entry-to-completion-observed latency buckets: [0,1], (1,2], (2,4],
+  (4,8], (8,16], (16,32], (32,64], and >64 microseconds.
+
+Sampling has overhead, including additional timestamp reads on sampled
+requests and a CPU-local sampling decision on each eligible attempt.
+Compare performance with sampling disabled too. Counters cover the whole
+provider, including background frees, and separate sysfs reads are not an
+atomic snapshot. Do not reload the module or change the benchmark settings
+during an interval. Disable sampling with ``echo 0 > latency_sample_every``;
+this preserves already collected statistics.
+
+A broader latency distribution under higher workload concurrency suggests
+load-dependent delays, but does not by itself distinguish queueing, memory
+traffic, device execution, interrupts, or completion visibility. Compare
+the same message size at several hackbench group counts to test this.
+
 The default mode is synchronous offload. Submission,
 mapping and polling overhead can outweigh any benefit, especially for 4 KiB
 pages. Measure different ``min_pages`` values on the target machine.
@@ -347,7 +403,7 @@ when the queue is bound. Repeat after unbinding the queue to exercise CPU
 fallback. Test concurrent allocation/free workloads while unbinding and
 rebinding the queue, and inspect the log for DMA API or locking errors.
 
-For batches, first use ``unsafe_async=0``. Repeat with ``batch_size`` set
+For batches, first use ``async_mode=0``. Repeat with ``batch_size`` set
 to 1, 2, 16 and a value above ``batch_capacity``, and with ``batch_wait_us``
 set to 0 and 2. Check that a single-thread workload finishes even with a
 large batch size, and that a concurrent workload increments
@@ -356,9 +412,10 @@ large batch size, and that a concurrent workload increments
 Exercise partial batches, descriptor exhaustion, changes back to
 ``batch_size=1`` under load, and unbinding with pending requests. Values 0
 and 1025 for ``batch_size``, and 1001 for ``batch_wait_us``, must be rejected.
-Only then repeat the unsafe timing experiment; it cannot validate zeroing
-correctness. After stopping its workload, disable ``unsafe_async`` and
-wait for ``pending_pages`` to reach zero before unbinding.
+Repeat with ``async_mode=1`` and caps of 0, 8 and 4096 pages. Check that
+``pending_pages`` drains to zero and pages are zero on subsequent allocation.
+Unbind under load to exercise the mandatory drain; switch modes with requests
+still outstanding to verify that their original ownership is retained.
 
 Repeat concurrent tests with ``batch_slots=1`` and ``batch_slots=8`` at
 module load, rebinding the WQ each time. For eight slots, look for a
@@ -367,8 +424,28 @@ positive ``overlapped_batch_submissions`` delta and
 need not reach the configured slot count. After quiescing the workload,
 ``inflight_batches`` must return to zero. Also test a WQ with only three
 software descriptors (one slot, two children), allocation-failure cleanup,
-out-of-order completions, and unbinding with pending unsafe batches.
+out-of-order completions, and unbinding with pending asynchronous batches.
 The worker must drain submitted slots even after the pending list empties.
 
 Compilation alone does not validate DMA ordering, fault handling, queue
 removal races, or performance; those require the target hardware.
+
+Allocator tests without DSA hardware
+------------------------------------
+
+``tools/dsa-page-clear/test-safe-async/test_safe_async.c`` is a fake provider
+for an isolated test kernel/VM. It captures only its own test allocations.
+It holds dirty order-0/order-3 pages while allocating other pages, checks they
+are not reused, then verifies zero contents after reacquiring the original
+range. Cases cover success, partial-write error with CPU repair, callback
+rejection, completion before callback return, compound teardown and draining
+at unregister. Build and run with no real page-clear provider bound::
+
+    make M=tools/dsa-page-clear/test-safe-async modules
+    # In a VM booted with init_on_free=1 init_on_alloc=0:
+    insmod test_safe_async.ko
+    dmesg | tail -20
+    rmmod test_safe_async
+
+All cases must print PASS. This checks the allocator contract, not DSA
+hardware ordering, DMA mapping errors or device fault recovery.

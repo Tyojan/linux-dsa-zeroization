@@ -16,6 +16,7 @@
 
 #include <linux/stddef.h>
 #include <linux/mm.h>
+#include <linux/dsa_page_clear.h>
 #include <linux/highmem.h>
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
@@ -1319,7 +1320,7 @@ static inline void pgalloc_tag_sub_pages(struct alloc_tag *tag, unsigned int nr)
 #endif /* CONFIG_MEM_ALLOC_PROFILING */
 
 static __always_inline bool __free_pages_prepare(struct page *page,
-		unsigned int order, fpi_t fpi_flags)
+		unsigned int order, fpi_t fpi_flags, bool allow_async)
 {
 	int bad = 0;
 	bool skip_kasan_poison = should_skip_kasan_poison(page);
@@ -1448,6 +1449,16 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 		if (kasan_has_integrated_init())
 			init = false;
 	}
+	/*
+	 * Preparation-only users (e.g. compaction) must retain ownership.
+	 * No page access after acceptance: another CPU may have freed it already.
+	 * Keep instrumented/debug mappings on the existing synchronous path.
+	 */
+	if (init && allow_async && fpi_flags == FPI_NONE &&
+	    !IS_ENABLED(CONFIG_KASAN) && !IS_ENABLED(CONFIG_KMSAN) &&
+	    !debug_pagealloc_enabled_static() && !PageHighMem(page) &&
+	    dsa_defer_clear_pages(page, order))
+		return false;
 	if (init)
 		clear_highpages_kasan_tagged(page, 1 << order,
 					   !(fpi_flags & FPI_NOLOCK));
@@ -1466,7 +1477,7 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 
 bool free_pages_prepare(struct page *page, unsigned int order)
 {
-	return __free_pages_prepare(page, order, FPI_NONE);
+	return __free_pages_prepare(page, order, FPI_NONE, false);
 }
 
 /*
@@ -1599,7 +1610,7 @@ static void __free_pages_ok(struct page *page, unsigned int order,
 	unsigned long pfn = page_to_pfn(page);
 	struct zone *zone = page_zone(page);
 
-	if (__free_pages_prepare(page, order, fpi_flags))
+	if (__free_pages_prepare(page, order, fpi_flags, true))
 		free_one_page(zone, page, pfn, order, fpi_flags);
 }
 
@@ -2965,7 +2976,7 @@ static void __free_frozen_pages(struct page *page, unsigned int order,
 		return;
 	}
 
-	if (!__free_pages_prepare(page, order, fpi_flags))
+	if (!__free_pages_prepare(page, order, fpi_flags, true))
 		return;
 
 	/*
@@ -3005,6 +3016,34 @@ void free_frozen_pages(struct page *page, unsigned int order)
 	__free_frozen_pages(page, order, FPI_NONE);
 }
 
+#ifdef CONFIG_X86_DSA_PAGE_CLEAR
+void dsa_free_pages_complete(struct page *page, unsigned int order, bool success)
+{
+	unsigned int i;
+
+	/* The provider has observed completion and unmapped the entire range. */
+	if (!success)
+		clear_highpages_kasan_tagged(page, 1 << order, false);
+	arch_free_page(page, order);
+	debug_pagealloc_unmap_pages(page, 1 << order);
+	/* A memory failure may have marked a held page since preparation. */
+	for (i = 0; i < (1U << order); i++) {
+		if (unlikely(PageHWPoison(page + i))) {
+			for (i = 0; i < (1U << order); i++) {
+				if (PageHWPoison(page + i))
+					clear_page_tag_ref(page + i);
+				else
+					__free_frozen_pages(page + i, 0, FPI_PREPARED);
+			}
+			return;
+		}
+	}
+	/* Accounting, checks and zeroing have already run exactly once. */
+	__free_frozen_pages(page, order, FPI_PREPARED);
+}
+EXPORT_SYMBOL_GPL(dsa_free_pages_complete);
+#endif
+
 void free_frozen_pages_nolock(struct page *page, unsigned int order)
 {
 	__free_frozen_pages(page, order, FPI_NOLOCK);
@@ -3025,7 +3064,7 @@ void free_unref_folios(struct folio_batch *folios)
 		unsigned long pfn = folio_pfn(folio);
 		unsigned int order = folio_order(folio);
 
-		if (!__free_pages_prepare(&folio->page, order, FPI_NONE))
+		if (!__free_pages_prepare(&folio->page, order, FPI_NONE, true))
 			continue;
 		/*
 		 * Free orders not handled on the PCP directly to the

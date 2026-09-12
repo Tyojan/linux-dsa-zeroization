@@ -324,9 +324,10 @@ config INTEL_IDXD_PAGE_CLEAR
 	depends on PREEMPT_COUNT && !PREEMPT_RT
 	select X86_DSA_PAGE_CLEAR
 	help
-	  Add synchronous DSA memory fill offload for init_on_free. Configure
+	  Add synchronous and safely deferred DSA fills for init_on_free. Configure
 	  a dedicated kernel work queue with driver_name dsa_page_clear to
 	  use it. Unavailable offload and atomic contexts use CPU clearing.
+	  The optional async_mode retains pages until zeroing has completed.
 
 	  This experimental implementation polls for completion. A hardware
 	  timeout panics rather than reusing memory still accessible to DMA.
