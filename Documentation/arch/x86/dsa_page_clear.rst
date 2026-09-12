@@ -81,20 +81,47 @@ ranges can be noncontiguous.
 
 The read-only ``batch_capacity`` reports the bound queue's usable limit:
 the minimum of the device limit, WQ ``max_batch_size``, 1024, and the number
-of software descriptor slots minus one. The effective maximum is the
+of software descriptor slots minus ``batch_slots_active``. The effective maximum is the
 smaller of ``batch_size`` and ``batch_capacity``. Batching requires BATCH
 support in both the device and the WQ operation configuration (if present),
 and at least three descriptor slots. Otherwise ``batch_capacity`` is 1 and
 requests use direct submission. Configure the WQ's ``max_batch_size`` before
 binding; the module parameter does not change hardware queue configuration.
 
-On a capable queue, binding reserves one descriptor for the BATCH parent
-and allocates a coherent, 64-byte-aligned child descriptor array. The
-reservation remains even with ``batch_size=1``. This prototype allows one
-hardware batch in flight at a time; new requests can accumulate while that
-batch executes. It reduces portal submissions, but still allocates one
-software descriptor and DMA mapping per free request. Locking, collection,
-and polling costs remain, so batching does not guarantee a speedup.
+On a capable queue, binding preallocates a pool of batch slots. Each slot
+owns a reserved parent descriptor and a coherent, 64-byte-aligned child
+descriptor array until its submission completes and its requests are
+retired. No array or parent is reused while hardware can still access it.
+``batch_slots`` selects the requested pool size at module load (default 8,
+range 1..1024); it is read-only in sysfs. The read-only
+``batch_slots_active`` reports the number actually allocated: the smaller
+of ``batch_slots`` and one third of the WQ's software descriptor count,
+leaving at least two children per reserved parent. It is zero when batching
+is unavailable. These reservations remain with ``batch_size=1`` too.
+
+For a WQ with 128 software descriptors, ``max_batch_size=1024`` and the
+default 8 slots, 120 descriptors remain for children and
+``batch_capacity=120``. All batches and direct submissions share this child
+pool. At ``batch_size=16``, at most seven full batches (112 children) plus
+one partial batch (up to eight children) can be outstanding, and callers
+holding completed descriptors can reduce this further. A full 120-child
+batch consumes the entire child pool, so increasing batch size does not
+necessarily increase concurrency. WQ size and hardware maximum batch size
+remain separate limits.
+
+Dispatch polls submitted slots once and attempts a new submission without
+waiting for hardware. The dispatcher lock is released between passes;
+collection-window waiting also occurs outside it. Later completions can
+be reaped before an earlier, slower batch. The dispatcher remains
+non-preemptible until it publishes all completed synchronous results,
+including when invoked by the worker. Otherwise a synchronous caller
+could occupy the CPU of a preempted worker that owns its completion.
+
+Multiple batches can now be outstanding in both modes, but each free still
+needs one software child descriptor and one DMA mapping. Locking,
+collection and polling costs remain, so batching does not guarantee a
+speedup. Allocation failure at bind time unwinds the entire slot pool;
+no memory is allocated for batch storage in the page-free path.
 
 ``batch_wait_us`` sets a collection window of 0..1000 microseconds from
 the oldest queued request, default 0. A dispatcher submits when the
@@ -106,7 +133,7 @@ not a guarantee on total latency: worker scheduling and preceding batches
 can delay submission further.
 
 In synchronous mode, concurrent callers can contribute to the same batch.
-Callers help dispatch batches themselves because they run with preemption
+Callers help dispatch and reap batches themselves because they run with preemption
 disabled and cannot rely on a worker being scheduled. Each caller waits
 until its descriptor's result is published after hardware completion, then
 unmaps its destination before returning. Submission failure, an unexecuted
@@ -142,6 +169,16 @@ Use counter deltas between benchmark runs:
 * ``batched_descriptors``: MEMFILL children in those accepted batches.
 * ``single_submissions``: directly submitted MEMFILLs, including partial
   batches containing only one request and batching-disabled requests.
+* ``overlapped_batch_submissions``: BATCH submissions made while another
+  BATCH submission was still awaiting completion reaping. Its delta shows
+  whether the benchmark exercised overlapping submissions.
+* ``inflight_batches``: current number of submitted BATCH descriptors whose
+  completions have not been reaped. This is a gauge, not a cumulative count;
+  directly submitted single-child slots are excluded.
+* ``peak_inflight_batches``: maximum of that gauge since module load. It is
+  not reset at benchmark boundaries or WQ rebinds. Read its before/after
+  values or reload the module to measure a fresh peak. These software
+  counters are not hardware WQ occupancy measurements.
 
 ``delta(batched_descriptors) / delta(batch_submissions)`` gives the mean
 number of children per submitted batch when the denominator is nonzero.
@@ -150,6 +187,13 @@ These count submissions, not successful completions; also check
 and child completion ordering follow the `Intel DSA architecture
 specification, sections 3.8 and 8.3.2
 <https://cdrdv2-public.intel.com/857060/341204-006-intel-data-streaming-accelerator-spec.pdf>`_.
+
+To change the slot pool, reload the module and rebind the WQ, for example
+using ``modprobe idxd_page_clear batch_slots=8`` at load time. Only the
+page-clear module needs rebuilding for this change; the provider ABI and
+page allocator are unchanged. Keep the slot count fixed when comparing
+``batch_size=1`` and ``batch_size=16`` so the number of available child
+descriptors is the same in both measurements.
 
 Unsafe early-return experiment with the old kernel
 ------------------------------------------------
@@ -315,6 +359,16 @@ and 1025 for ``batch_size``, and 1001 for ``batch_wait_us``, must be rejected.
 Only then repeat the unsafe timing experiment; it cannot validate zeroing
 correctness. After stopping its workload, disable ``unsafe_async`` and
 wait for ``pending_pages`` to reach zero before unbinding.
+
+Repeat concurrent tests with ``batch_slots=1`` and ``batch_slots=8`` at
+module load, rebinding the WQ each time. For eight slots, look for a
+positive ``overlapped_batch_submissions`` delta and
+``peak_inflight_batches > 1``; a fast device or low-concurrency workload
+need not reach the configured slot count. After quiescing the workload,
+``inflight_batches`` must return to zero. Also test a WQ with only three
+software descriptors (one slot, two children), allocation-failure cleanup,
+out-of-order completions, and unbinding with pending unsafe batches.
+The worker must drain submitted slots even after the pending list empties.
 
 Compilation alone does not validate DMA ordering, fault handling, queue
 removal races, or performance; those require the target hardware.
