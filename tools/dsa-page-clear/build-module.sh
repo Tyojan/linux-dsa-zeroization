@@ -7,13 +7,29 @@ DSA_SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 DSA_SRC=$(CDPATH= cd -- "$DSA_SCRIPT_DIR/../.." && pwd)
 DSA_KDIR=${DSA_KDIR:-$DSA_SRC}
 DSA_MODULE_DIR=$DSA_SRC/drivers/dma/idxd
-DSA_CC=${DSA_CC:-gcc-11}
+DSA_CC=${DSA_CC:-gcc}
 DSA_JOBS=${DSA_JOBS:-$(nproc)}
+DSA_KCFLAGS=${KCFLAGS:-}
 
 DSA_KDIR=$(CDPATH= cd -- "$DSA_KDIR" && pwd)
-test -f "$DSA_KDIR/include/generated/autoconf.h"
-test -f "$DSA_KDIR/Module.symvers"
-test -f "$DSA_KDIR/arch/x86/include/asm/dsa.h"
+for DSA_REQUIRED_FILE in \
+    include/generated/autoconf.h \
+    Module.symvers \
+    scripts/Makefile.build \
+    scripts/Makefile.ubsan \
+    scripts/pahole-version.sh; do
+    if [ ! -f "$DSA_KDIR/$DSA_REQUIRED_FILE" ]; then
+        echo "DSA_KDIR is not a complete prepared kernel build tree: $DSA_KDIR" >&2
+        echo "Missing: $DSA_KDIR/$DSA_REQUIRED_FILE" >&2
+        echo "Build against the tree used for the running kernel, for example:" >&2
+        echo "  DSA_KDIR=/path/to/prepared/linux $0" >&2
+        exit 1
+    fi
+done
+if [ ! -f "$DSA_SRC/arch/x86/include/asm/dsa.h" ]; then
+    echo "Missing page-clear provider header: $DSA_SRC/arch/x86/include/asm/dsa.h" >&2
+    exit 1
+fi
 
 # This prototype uses the old, synchronous provider ABI. Do not accidentally
 # build it using the discarded kernel's symbol versions or header layout.
@@ -26,16 +42,15 @@ awk '
     echo "DSA_KDIR must contain the old kernel's full Module.symvers." >&2
     exit 1
 }
-if grep -q 'clear_async' "$DSA_KDIR/arch/x86/include/asm/dsa.h"; then
-    echo "DSA_KDIR still contains the discarded asynchronous kernel ABI." >&2
-    exit 1
-fi
-
 # Force a fresh module link without split BTF tied to another vmlinux.
 # An empty override is intentional: CONFIG_DEBUG_INFO_BTF_MODULES=n is
 # still nonempty to Kbuild's ifdef and would not disable this step.
 rm -f "$DSA_MODULE_DIR/idxd_page_clear.ko"
-make -C "$DSA_KDIR" -j"$DSA_JOBS" CC="$DSA_CC" W=1 \
+# The matching old build tree may have generated headers and Module.symvers
+# but no checked-out dsa.h.  Compile the module against its provider header
+# from this source tree while Kbuild uses DSA_KDIR for ABI symbol CRCs.
+DSA_KCFLAGS="$DSA_KCFLAGS -I$DSA_SRC/arch/x86/include"
+make -C "$DSA_KDIR" -j"$DSA_JOBS" CC="$DSA_CC" KCFLAGS="$DSA_KCFLAGS" W=1 \
     M="$DSA_MODULE_DIR" CONFIG_DEBUG_INFO_BTF_MODULES= idxd_page_clear.ko
 
 echo "Built: $DSA_MODULE_DIR/idxd_page_clear.ko"
