@@ -344,6 +344,8 @@ void flush_thread(void)
 void arch_release_task_struct(struct task_struct *tsk)
 {
 	fpsimd_release_task(tsk);
+	memzero_explicit(&tsk->thread.uw.fpsimd_state,
+			 sizeof(tsk->thread.uw.fpsimd_state));
 }
 
 int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)

@@ -136,6 +136,10 @@ void exit_thread(struct task_struct *tsk)
 
 	shstk_free(tsk);
 	fpu__drop(tsk);
+
+	if (!(tsk->flags & (PF_KTHREAD | PF_USER_WORKER)))
+		memzero_explicit(&x86_task_fpu(tsk)->__fpstate.regs,
+				 fpu_kernel_cfg.default_size);
 }
 
 static int set_new_tls(struct task_struct *p, unsigned long tls)
