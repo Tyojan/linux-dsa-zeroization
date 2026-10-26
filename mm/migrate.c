@@ -776,6 +776,10 @@ void folio_migrate_flags(struct folio *newfolio, struct folio *folio)
 {
 	int cpupid;
 
+	/* Both the old storage and the migrated copy must be wiped on free. */
+	if (PageWantInit(&folio->page))
+		SetPageWantInit(&newfolio->page);
+
 	if (folio_test_referenced(folio))
 		folio_set_referenced(newfolio);
 	if (folio_test_uptodate(folio))

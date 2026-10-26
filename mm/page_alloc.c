@@ -1318,6 +1318,11 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 {
 	int bad = 0;
 	bool skip_kasan_poison = should_skip_kasan_poison(page);
+	/*
+	 * PageWantInit is a per-page request to clear data before the page
+	 * returns to the allocator. Test-and-clear it here so the request
+	 * cannot leak into a subsequent allocation of this physical page.
+	 */
 	bool init = want_init_on_free();
 	bool compound = PageCompound(page);
 	struct folio *folio = page_folio(page);
@@ -1380,6 +1385,9 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 		for (i = 1; i < (1 << order); i++) {
 			struct page *tail_page = page + i;
 
+			/* A large folio may have per-subpage init requests. */
+			init |= TestClearPageWantInit(tail_page);
+
 			if (compound)
 				bad += free_tail_page_prepare(page, tail_page);
 			if (is_check_pages_enabled()) {
@@ -1411,6 +1419,7 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 		if (bad)
 			return false;
 	}
+	init |= TestClearPageWantInit(page);
 
 	page_cpupid_reset_last(page);
 	page->flags.f &= ~PAGE_FLAGS_CHECK_AT_PREP;

@@ -2907,6 +2907,16 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		if (arg3 & PR_CFI_LOCK && !(arg3 & PR_CFI_DISABLE))
 			error = arch_prctl_lock_branch_landing_pad_state(me);
 		break;
+	case PR_SET_ZEROIZE_ON_FREE:
+		if (arg2 > 1 || arg3 || arg4 || arg5 || !me->mm)
+			return -EINVAL;
+		error = mm_set_zeroize_on_free(me->mm, !!arg2);
+		break;
+	case PR_GET_ZEROIZE_ON_FREE:
+		if (arg2 || arg3 || arg4 || arg5 || !me->mm)
+			return -EINVAL;
+		error = READ_ONCE(me->mm->zeroize_on_free);
+		break;
 	default:
 		trace_task_prctl_unknown(option, arg2, arg3, arg4, arg5);
 		error = -EINVAL;

@@ -1531,6 +1531,7 @@ static __always_inline void __folio_add_anon_rmap(struct folio *folio,
 
 	VM_WARN_ON_FOLIO(!folio_test_anon(folio), folio);
 
+	folio_mark_zeroize_on_free(folio, vma);
 	__folio_add_rmap(folio, page, nr_pages, vma, level);
 
 	if (likely(!folio_test_ksm(folio)))
@@ -1665,6 +1666,8 @@ void folio_add_new_anon_rmap(struct folio *folio, struct vm_area_struct *vma,
 	if (!folio_test_swapbacked(folio) && !(vma->vm_flags & VM_DROPPABLE))
 		__folio_set_swapbacked(folio);
 	__folio_set_anon(folio, vma, address, exclusive);
+
+	folio_mark_zeroize_on_free(folio, vma);
 
 	if (likely(!folio_test_large(folio))) {
 		/* increment count (starts at -1) */

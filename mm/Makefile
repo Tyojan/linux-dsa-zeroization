@@ -42,6 +42,7 @@ mmu-$(CONFIG_MMU)	:= highmem.o memory.o mincore.o \
 
 ifdef CONFIG_CROSS_MEMORY_ATTACH
 mmu-$(CONFIG_MMU)	+= process_vm_access.o
+mmu-$(CONFIG_MMU)	+= przero.o
 endif
 
 ifdef CONFIG_64BIT

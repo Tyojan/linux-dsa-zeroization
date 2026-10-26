@@ -4215,6 +4215,16 @@ void anon_rmap_tree_verify(struct anon_vma_chain *avc);
 /* mmap.c */
 extern int __vm_enough_memory(const struct mm_struct *mm, long pages, int cap_sys_admin);
 extern void exit_mmap(struct mm_struct *);
+#ifdef CONFIG_MMU
+int mm_set_zeroize_on_free(struct mm_struct *mm, bool enable);
+void folio_mark_zeroize_on_free(struct folio *folio,
+			       struct vm_area_struct *vma);
+#else
+static inline int mm_set_zeroize_on_free(struct mm_struct *mm, bool enable)
+{
+	return -EOPNOTSUPP;
+}
+#endif
 bool mmap_read_lock_maybe_expand(struct mm_struct *mm, struct vm_area_struct *vma,
 				 unsigned long addr, bool write);
 

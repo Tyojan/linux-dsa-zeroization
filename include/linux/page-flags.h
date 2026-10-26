@@ -111,6 +111,11 @@ enum pageflags {
 	PG_swapbacked,		/* Page is backed by RAM/swap */
 	PG_unevictable,		/* Page is "unevictable"  */
 	PG_dropbehind,		/* drop pages on IO completion */
+	/*
+	 * The page contains data which must be initialized before it can
+	 * re-enter the page allocator (including PCP lists).
+	 */
+	PG_want_init,
 #ifdef CONFIG_MMU
 	PG_mlocked,		/* Page is vma mlocked */
 #endif
@@ -556,6 +561,8 @@ FOLIO_FLAG(active, FOLIO_HEAD_PAGE)
 	FOLIO_TEST_CLEAR_FLAG(active, FOLIO_HEAD_PAGE)
 PAGEFLAG(Workingset, workingset, PF_HEAD)
 	TESTCLEARFLAG(Workingset, workingset, PF_HEAD)
+PAGEFLAG(WantInit, want_init, PF_ANY)
+	TESTSCFLAG(WantInit, want_init, PF_ANY)
 PAGEFLAG(Checked, checked, PF_NO_COMPOUND)	   /* Used by some filesystems */
 
 /* Xen */
