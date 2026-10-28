@@ -2531,6 +2531,22 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
 	return 0;
 }
 
+/* Apply the mm policy to every live task using it, including existing threads. */
+static void prctl_set_task_struct_zeroize(struct mm_struct *mm)
+{
+	struct task_struct *group, *task;
+	bool enable = READ_ONCE(mm->zeroize_on_free);
+
+	read_lock(&tasklist_lock);
+	for_each_process_thread(group, task) {
+		task_lock(task);
+		if (task->mm == mm)
+			WRITE_ONCE(task->zeroize_task_struct_on_free, enable);
+		task_unlock(task);
+	}
+	read_unlock(&tasklist_lock);
+}
+
 SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		unsigned long, arg4, unsigned long, arg5)
 {
@@ -2911,6 +2927,7 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		if (arg2 > 1 || arg3 || arg4 || arg5 || !me->mm)
 			return -EINVAL;
 		error = mm_set_zeroize_on_free(me->mm, !!arg2);
+		prctl_set_task_struct_zeroize(me->mm);
 		break;
 	case PR_GET_ZEROIZE_ON_FREE:
 		if (arg2 || arg3 || arg4 || arg5 || !me->mm)

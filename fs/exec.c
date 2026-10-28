@@ -882,6 +882,9 @@ static int exec_mmap(struct linux_binprm *bprm)
 	active_mm = tsk->active_mm;
 	tsk->active_mm = mm;
 	tsk->mm = mm;
+	/* exec installs a new mm, whose zeroization policy starts disabled. */
+	WRITE_ONCE(tsk->zeroize_task_struct_on_free,
+		   READ_ONCE(mm->zeroize_on_free));
 	sched_cache_exec_mmap(tsk, mm);
 	mm_init_cid(mm, tsk);
 	exec_state = task_exec_state_replace(tsk, exec_state);

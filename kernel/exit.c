@@ -582,6 +582,9 @@ static void exit_mm(void)
 	 */
 	smp_mb__after_spinlock();
 	local_irq_disable();
+	/* Preserve the mm policy after current->mm is detached. */
+	if (READ_ONCE(mm->zeroize_on_free))
+		WRITE_ONCE(current->zeroize_task_struct_on_free, true);
 	current->mm = NULL;
 	membarrier_update_current_mm(NULL);
 	enter_lazy_tlb(mm, current);

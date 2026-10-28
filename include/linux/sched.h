@@ -979,6 +979,8 @@ struct task_struct {
 
 	struct mm_struct		*mm;
 	struct mm_struct		*active_mm;
+	/* Wipe this task_struct object before returning it to the slab cache. */
+	bool				zeroize_task_struct_on_free;
 
 	struct task_exec_state __rcu	*exec_state;
 

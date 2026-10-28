@@ -190,6 +190,8 @@ static inline struct task_struct *alloc_task_struct_node(int node)
 
 static inline void free_task_struct(struct task_struct *tsk)
 {
+	if (READ_ONCE(tsk->zeroize_task_struct_on_free))
+		memzero_explicit(tsk, arch_task_struct_size);
 	kmem_cache_free(task_struct_cachep, tsk);
 }
 
@@ -924,8 +926,14 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 		return NULL;
 
 	err = arch_dup_task_struct(tsk, orig);
-	if (err)
+	if (err) {
+		/* An arch hook may have copied only part of the parent task. */
+		memzero_explicit(tsk, arch_task_struct_size);
 		goto free_tsk;
+	}
+	/* Cover fork failure paths before copy_mm() installs the child's mm. */
+	tsk->zeroize_task_struct_on_free = orig->mm &&
+		READ_ONCE(orig->mm->zeroize_on_free);
 
 	err = alloc_thread_stack_node(tsk, node);
 	if (err)
@@ -1599,6 +1607,8 @@ static int copy_mm(u64 clone_flags, struct task_struct *tsk)
 
 	tsk->mm = mm;
 	tsk->active_mm = mm;
+	WRITE_ONCE(tsk->zeroize_task_struct_on_free,
+		   READ_ONCE(mm->zeroize_on_free));
 	sched_cache_fork(tsk);
 	return 0;
 }
