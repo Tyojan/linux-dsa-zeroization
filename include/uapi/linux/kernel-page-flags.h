@@ -37,4 +37,7 @@
 #define KPF_IDLE		25
 #define KPF_PGTABLE		26
 
+/* Experimental: page must be cleared before returning to the allocator. */
+#define KPF_WANT_INIT		27
+
 #endif /* _UAPILINUX_KERNEL_PAGE_FLAGS_H */

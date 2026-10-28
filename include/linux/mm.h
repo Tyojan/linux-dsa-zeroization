@@ -4217,12 +4217,17 @@ extern int __vm_enough_memory(const struct mm_struct *mm, long pages, int cap_sy
 extern void exit_mmap(struct mm_struct *);
 #ifdef CONFIG_MMU
 int mm_set_zeroize_on_free(struct mm_struct *mm, bool enable);
+void mm_check_zeroize_on_free(struct mm_struct *mm);
 void folio_mark_zeroize_on_free(struct folio *folio,
 			       struct vm_area_struct *vma);
 #else
 static inline int mm_set_zeroize_on_free(struct mm_struct *mm, bool enable)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline void mm_check_zeroize_on_free(struct mm_struct *mm)
+{
 }
 #endif
 bool mmap_read_lock_maybe_expand(struct mm_struct *mm, struct vm_area_struct *vma,

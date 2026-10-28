@@ -222,6 +222,9 @@ u64 stable_page_flags(const struct page *page)
 	u |= kpf_copy_bit(k, KPF_SWAPBACKED,	PG_swapbacked);
 	u |= kpf_copy_bit(k, KPF_UNEVICTABLE,	PG_unevictable);
 	u |= kpf_copy_bit(k, KPF_MLOCKED,	PG_mlocked);
+	/* Keep this per physical page: tail pages may carry their own request. */
+	u |= kpf_copy_bit(ps.page_snapshot.flags.f, KPF_WANT_INIT,
+			  PG_want_init);
 
 #ifdef CONFIG_MEMORY_FAILURE
 	if (u & BIT_ULL(KPF_HUGE))

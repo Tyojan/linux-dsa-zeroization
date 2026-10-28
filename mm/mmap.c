@@ -1297,6 +1297,7 @@ void exit_mmap(struct mm_struct *mm)
 	mmu_notifier_release(mm);
 
 	mmap_read_lock(mm);
+	mm_check_zeroize_on_free(mm);
 	arch_exit_mmap(mm);
 
 	vma = vma_next(&vmi);
@@ -1326,6 +1327,17 @@ void exit_mmap(struct mm_struct *mm)
 	unmap_pgtable_init(&unmap, &vmi);
 	free_pgtables(&tlb, &unmap);
 	tlb_finish_mmu(&tlb);
+
+	/*
+	 * Anonymous folios can retain a transient reference while queued in a
+	 * per-CPU LRU batch.  The PTE references above have now been dropped,
+	 * but such a batch reference would defer the final free (and therefore
+	 * PG_want_init zeroization) until an unrelated later LRU drain.  This is
+	 * intentionally a heavy PoC: make PR_SET_ZEROIZE_ON_FREE synchronous with
+	 * respect to those deferred LRU references at final mm teardown.
+	 */
+	if (READ_ONCE(mm->zeroize_on_free))
+		lru_add_drain_all();
 
 	/*
 	 * Walk the list again, actually closing and freeing it, with preemption

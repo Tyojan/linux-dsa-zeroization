@@ -69,6 +69,96 @@ static const struct mm_walk_ops przero_walk_ops = {
 	.walk_lock = PGWALK_WRLOCK,
 };
 
+struct przero_check {
+	unsigned long mapped;
+	unsigned long missing;
+	unsigned long first_addr;
+	unsigned long first_pfn;
+};
+
+static void przero_check_page(struct page *page, unsigned long addr,
+			      struct przero_check *check)
+{
+	struct folio *folio = page_folio(page);
+
+	check->mapped++;
+	if (PageWantInit(&folio->page))
+		return;
+	check->missing++;
+	if (check->missing == 1) {
+		check->first_addr = addr;
+		check->first_pfn = page_to_pfn(page);
+	}
+}
+
+static int przero_check_pte_entry(pte_t *ptep, unsigned long addr,
+				 unsigned long end, struct mm_walk *walk)
+{
+	struct przero_check *check = walk->private;
+	struct page *page;
+	pte_t pte = ptep_get(ptep);
+
+	if (!pte_present(pte))
+		return 0;
+	page = vm_normal_page(walk->vma, addr, pte);
+	if (page)
+		przero_check_page(page, addr, check);
+	return 0;
+}
+
+static int przero_check_pmd_entry(pmd_t *pmdp, unsigned long addr,
+				 unsigned long end, struct mm_walk *walk)
+{
+	struct przero_check *check = walk->private;
+	spinlock_t *ptl = pmd_trans_huge_lock(pmdp, walk->vma);
+	struct page *page;
+	pmd_t pmd;
+
+	if (!ptl)
+		return 0;
+	pmd = *pmdp;
+	if (pmd_present(pmd)) {
+		page = vm_normal_page_pmd(walk->vma, addr, pmd);
+		if (page)
+			przero_check_page(page, addr, check);
+	}
+	walk->action = ACTION_CONTINUE;
+	spin_unlock(ptl);
+	return 0;
+}
+
+static const struct mm_walk_ops przero_check_walk_ops = {
+	.test_walk = przero_test_walk,
+	.pmd_entry = przero_check_pmd_entry,
+	.pte_entry = przero_check_pte_entry,
+	.walk_lock = PGWALK_RDLOCK,
+};
+
+/*
+ * exit_mmap() calls this before unmapping.  It is diagnostic only: a missing
+ * marker is reported, but not repaired, so that marker-loss paths remain
+ * visible during this PoC.
+ */
+void mm_check_zeroize_on_free(struct mm_struct *mm)
+{
+	struct przero_check check = {};
+	int ret;
+
+	if (!READ_ONCE(mm->zeroize_on_free))
+		return;
+
+	ret = walk_page_range(mm, 0, TASK_SIZE, &przero_check_walk_ops, &check);
+	if (ret) {
+		pr_warn("przero: pid %d exit mm %px: marker check failed: %d\n",
+			current->pid, mm, ret);
+		return;
+	}
+	if (check.missing)
+		pr_warn("przero: pid %d exit mm %px: %lu/%lu private anon mappings lack PG_want_init (first va %#lx, pfn %#lx)\n",
+			current->pid, mm, check.missing, check.mapped,
+			check.first_addr, check.first_pfn);
+}
+
 /*
  * Enable policy before scanning resident mappings. VMA write locks also
  * serialize against faults using per-VMA locking. Nonresident swap/migration
