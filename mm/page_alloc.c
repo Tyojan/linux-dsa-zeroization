@@ -39,6 +39,7 @@
 #include <linux/compaction.h>
 #include <trace/events/kmem.h>
 #include <trace/events/oom.h>
+#include <trace/events/przero.h>
 #include <linux/prefetch.h>
 #include <linux/mm_inline.h>
 #include <linux/mmu_notifier.h>
@@ -53,6 +54,7 @@
 #include <linux/khugepaged.h>
 #include <linux/delayacct.h>
 #include <linux/cacheinfo.h>
+#include <linux/ktime.h>
 #include <linux/pgalloc_tag.h>
 #include <asm/div64.h>
 #include "internal.h"
@@ -1324,6 +1326,8 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 	 * cannot leak into a subsequent allocation of this physical page.
 	 */
 	bool init = want_init_on_free();
+	bool requested = false;
+	u64 zero_start_ns = 0;
 	bool compound = PageCompound(page);
 	struct folio *folio = page_folio(page);
 
@@ -1384,9 +1388,12 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 		}
 		for (i = 1; i < (1 << order); i++) {
 			struct page *tail_page = page + i;
+			bool tail_requested;
 
 			/* A large folio may have per-subpage init requests. */
-			init |= TestClearPageWantInit(tail_page);
+			tail_requested = TestClearPageWantInit(tail_page);
+			requested |= tail_requested;
+			init |= tail_requested;
 
 			if (compound)
 				bad += free_tail_page_prepare(page, tail_page);
@@ -1419,7 +1426,8 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 		if (bad)
 			return false;
 	}
-	init |= TestClearPageWantInit(page);
+	requested |= TestClearPageWantInit(page);
+	init |= requested;
 
 	page_cpupid_reset_last(page);
 	page->flags.f &= ~PAGE_FLAGS_CHECK_AT_PREP;
@@ -1436,6 +1444,8 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 	}
 
 	kernel_poison_pages(page, 1 << order);
+	if (requested && trace_przero_page_zero_enabled())
+		zero_start_ns = ktime_get_ns();
 
 	/*
 	 * As memory initialization might be integrated into KASAN,
@@ -1454,6 +1464,9 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 	}
 	if (init)
 		clear_highpages_kasan_tagged(page, 1 << order);
+	if (zero_start_ns)
+		trace_przero_page_zero(page_to_pfn(page), 1UL << order,
+				ktime_get_ns() - zero_start_ns);
 
 	/*
 	 * arch_free_page() can make the page's contents inaccessible.  s390

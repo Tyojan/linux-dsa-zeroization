@@ -121,6 +121,7 @@
 #include "../mm/internal.h"
 
 #include <trace/events/sched.h>
+#include <trace/events/przero.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/task.h>
@@ -190,8 +191,17 @@ static inline struct task_struct *alloc_task_struct_node(int node)
 
 static inline void free_task_struct(struct task_struct *tsk)
 {
-	if (READ_ONCE(tsk->zeroize_task_struct_on_free))
+	if (READ_ONCE(tsk->zeroize_task_struct_on_free)) {
+		pid_t pid = tsk->pid;
+		u64 start_ns = 0;
+
+		if (trace_przero_task_zero_enabled())
+			start_ns = ktime_get_ns();
 		memzero_explicit(tsk, arch_task_struct_size);
+		if (start_ns)
+			trace_przero_task_zero(pid, tsk, arch_task_struct_size,
+					ktime_get_ns() - start_ns);
+	}
 	kmem_cache_free(task_struct_cachep, tsk);
 }
 

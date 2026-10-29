@@ -4,6 +4,10 @@
 #include <linux/hugetlb.h>
 #include <linux/pagewalk.h>
 #include <linux/sched.h>
+#include <linux/ktime.h>
+
+#define CREATE_TRACE_POINTS
+#include <trace/events/przero.h>
 
 static bool przero_vma(struct vm_area_struct *vma)
 {
@@ -12,15 +16,28 @@ static bool przero_vma(struct vm_area_struct *vma)
 		!is_vm_hugetlb_page(vma);
 }
 
-/* Called with the page-table lock held, before publishing anon mappings. */
-void folio_mark_zeroize_on_free(struct folio *folio,
-			       struct vm_area_struct *vma)
+static bool przero_mark_folio(struct folio *folio,
+			      struct vm_area_struct *vma)
 {
 	if (unlikely(READ_ONCE(vma->vm_mm->zeroize_on_free)) &&
 	    przero_vma(vma) && folio_test_anon(folio) &&
 	    !folio_is_zone_device(folio))
-		SetPageWantInit(&folio->page);
+		return !TestSetPageWantInit(&folio->page);
+	return false;
 }
+
+/* Called with the page-table lock held, before publishing anon mappings. */
+void folio_mark_zeroize_on_free(struct folio *folio,
+			       struct vm_area_struct *vma)
+{
+	przero_mark_folio(folio, vma);
+}
+
+struct przero_walk_stats {
+	unsigned long vmas;
+	unsigned long ptes;
+	unsigned long marked_pages;
+};
 
 static int przero_test_walk(unsigned long addr, unsigned long end,
 			    struct mm_walk *walk)
@@ -28,34 +45,52 @@ static int przero_test_walk(unsigned long addr, unsigned long end,
 	return !przero_vma(walk->vma);
 }
 
+static int przero_mark_walk(unsigned long addr, unsigned long end,
+			    struct mm_walk *walk)
+{
+	struct przero_walk_stats *stats = walk->private;
+
+	if (!przero_vma(walk->vma))
+		return 1;
+	if (stats)
+		stats->vmas++;
+	return 0;
+}
+
 static int przero_pte_entry(pte_t *ptep, unsigned long addr,
 			    unsigned long end, struct mm_walk *walk)
 {
+	struct przero_walk_stats *stats = walk->private;
 	pte_t pte = ptep_get(ptep);
 	struct page *page;
 
+	if (stats)
+		stats->ptes++;
 	if (!pte_present(pte))
 		return 0;
 	page = vm_normal_page(walk->vma, addr, pte);
-	if (page)
-		folio_mark_zeroize_on_free(page_folio(page), walk->vma);
+	if (page && przero_mark_folio(page_folio(page), walk->vma) && stats)
+		stats->marked_pages += folio_nr_pages(page_folio(page));
 	return 0;
 }
 
 static int przero_pmd_entry(pmd_t *pmdp, unsigned long addr,
 			    unsigned long end, struct mm_walk *walk)
 {
+	struct przero_walk_stats *stats = walk->private;
 	spinlock_t *ptl = pmd_trans_huge_lock(pmdp, walk->vma);
 	struct page *page;
 	pmd_t pmd;
 
 	if (!ptl)
 		return 0;
+	if (stats)
+		stats->ptes++;
 	pmd = *pmdp;
 	if (pmd_present(pmd)) {
 		page = vm_normal_page_pmd(walk->vma, addr, pmd);
-		if (page)
-			folio_mark_zeroize_on_free(page_folio(page), walk->vma);
+		if (page && przero_mark_folio(page_folio(page), walk->vma) && stats)
+			stats->marked_pages += folio_nr_pages(page_folio(page));
 	}
 	walk->action = ACTION_CONTINUE;
 	spin_unlock(ptl);
@@ -63,7 +98,7 @@ static int przero_pmd_entry(pmd_t *pmdp, unsigned long addr,
 }
 
 static const struct mm_walk_ops przero_walk_ops = {
-	.test_walk = przero_test_walk,
+	.test_walk = przero_mark_walk,
 	.pmd_entry = przero_pmd_entry,
 	.pte_entry = przero_pte_entry,
 	.walk_lock = PGWALK_WRLOCK,
@@ -167,13 +202,25 @@ void mm_check_zeroize_on_free(struct mm_struct *mm)
  */
 int mm_set_zeroize_on_free(struct mm_struct *mm, bool enable)
 {
+	struct przero_walk_stats stats = {};
+	bool tracing;
+	u64 start_ns = 0;
 	int ret = 0;
 
 	if (mmap_write_lock_killable(mm))
 		return -EINTR;
 	WRITE_ONCE(mm->zeroize_on_free, enable);
-	if (enable)
-		ret = walk_page_range(mm, 0, TASK_SIZE, &przero_walk_ops, NULL);
+	if (enable) {
+		tracing = trace_przero_prctl_walk_enabled();
+		if (tracing)
+			start_ns = ktime_get_ns();
+		ret = walk_page_range(mm, 0, TASK_SIZE, &przero_walk_ops,
+				      tracing ? &stats : NULL);
+		if (tracing)
+			trace_przero_prctl_walk(current->pid, mm,
+				ktime_get_ns() - start_ns, stats.vmas,
+				stats.ptes, stats.marked_pages, ret);
+	}
 	mmap_write_unlock(mm);
 	return ret;
 }

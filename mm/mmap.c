@@ -54,6 +54,7 @@
 #include <asm/tlb.h>
 #include <asm/mmu_context.h>
 
+#include <trace/events/przero.h>
 #define CREATE_TRACE_POINTS
 #include <trace/events/mmap.h>
 
@@ -1292,6 +1293,11 @@ void exit_mmap(struct mm_struct *mm)
 	unsigned long nr_accounted = 0;
 	VMA_ITERATOR(vmi, mm, 0);
 	struct unmap_desc unmap;
+	bool przero = READ_ONCE(mm->zeroize_on_free);
+
+	if (trace_przero_lifecycle_enabled())
+		trace_przero_lifecycle(current->pid, current, mm,
+				       PRZERO_EXIT_MMAP_BEGIN, przero);
 
 	/* mm's last user has gone, and its about to be pulled down */
 	mmu_notifier_release(mm);
@@ -1336,8 +1342,15 @@ void exit_mmap(struct mm_struct *mm)
 	 * intentionally a heavy PoC: make PR_SET_ZEROIZE_ON_FREE synchronous with
 	 * respect to those deferred LRU references at final mm teardown.
 	 */
-	if (READ_ONCE(mm->zeroize_on_free))
+	if (przero) {
+		if (trace_przero_lifecycle_enabled())
+			trace_przero_lifecycle(current->pid, current, mm,
+					       PRZERO_LRU_DRAIN_BEGIN, przero);
 		lru_add_drain_all();
+		if (trace_przero_lifecycle_enabled())
+			trace_przero_lifecycle(current->pid, current, mm,
+					       PRZERO_LRU_DRAIN_END, przero);
+	}
 
 	/*
 	 * Walk the list again, actually closing and freeing it, with preemption
@@ -1351,6 +1364,9 @@ destroy:
 	trace_exit_mmap(mm);
 	mmap_write_unlock(mm);
 	vm_unacct_memory(nr_accounted);
+	if (trace_przero_lifecycle_enabled())
+		trace_przero_lifecycle(current->pid, current, mm,
+				       PRZERO_EXIT_MMAP_END, przero);
 }
 
 /*

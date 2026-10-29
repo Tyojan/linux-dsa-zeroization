@@ -53,6 +53,7 @@
 #include <linux/init_task.h>
 #include <linux/perf_event.h>
 #include <trace/events/sched.h>
+#include <trace/events/przero.h>
 #include <linux/hw_breakpoint.h>
 #include <linux/oom.h>
 #include <linux/writeback.h>
@@ -558,10 +559,15 @@ void mm_update_next_owner(struct mm_struct *mm)
 static void exit_mm(void)
 {
 	struct mm_struct *mm = current->mm;
+	bool przero;
 
 	mm_exit_exec_release(current, mm);
 	if (!mm)
 		return;
+	przero = READ_ONCE(mm->zeroize_on_free);
+	if (trace_przero_lifecycle_enabled())
+		trace_przero_lifecycle(current->pid, current, mm,
+				       PRZERO_EXIT_MM_BEGIN, przero);
 
 	sched_cache_exit_mm(current);
 
@@ -595,6 +601,9 @@ static void exit_mm(void)
 	mmput(mm);
 	if (test_thread_flag(TIF_MEMDIE))
 		exit_oom_victim();
+	if (trace_przero_lifecycle_enabled())
+		trace_przero_lifecycle(current->pid, current, mm,
+				       PRZERO_EXIT_MM_END, przero);
 }
 
 static struct task_struct *find_alive_thread(struct task_struct *p)
@@ -909,8 +918,15 @@ static void synchronize_group_exit(struct task_struct *tsk, long code)
 void __noreturn do_exit(long code)
 {
 	struct task_struct *tsk = current;
+	struct mm_struct *przero_mm = tsk->mm;
+	bool przero = READ_ONCE(tsk->zeroize_task_struct_on_free) ||
+		(przero_mm && READ_ONCE(przero_mm->zeroize_on_free));
 	struct kthread *kthread;
 	int group_dead;
+
+	if (trace_przero_lifecycle_enabled())
+		trace_przero_lifecycle(tsk->pid, tsk, przero_mm,
+				       PRZERO_DO_EXIT_BEGIN, przero);
 
 	WARN_ON(irqs_disabled());
 	WARN_ON(tsk->plug);
@@ -1027,6 +1043,9 @@ void __noreturn do_exit(long code)
 		__this_cpu_add(dirty_throttle_leaks, tsk->nr_dirtied);
 	exit_rcu();
 	exit_tasks_rcu_finish();
+	if (trace_przero_lifecycle_enabled())
+		trace_przero_lifecycle(tsk->pid, tsk, przero_mm,
+				       PRZERO_DO_EXIT_END, przero);
 
 	lockdep_free_task(tsk);
 	do_task_dead();
