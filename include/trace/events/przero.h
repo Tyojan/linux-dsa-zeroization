@@ -55,7 +55,7 @@ TRACE_EVENT(przero_lifecycle,
 		  __entry->zeroize)
 );
 
-TRACE_EVENT(przero_prctl_walk,
+TRACE_EVENT(przero_policy_walk,
 	TP_PROTO(pid_t pid, const void *mm, u64 duration_ns,
 		 unsigned long vmas, unsigned long ptes,
 		 unsigned long marked_pages, int ret),

@@ -355,6 +355,7 @@ enum {
 	DECLARE_VMA_BIT(UFFD_MINOR, 41),
 	DECLARE_VMA_BIT(SEALED, 42),
 	DECLARE_VMA_BIT(UFFD_RWP, 43),
+	DECLARE_VMA_BIT(ZEROIZE_ON_FREE, 44), /* Wipe private anonymous pages on final free. */
 	/* Flags that reuse flags above. */
 	DECLARE_VMA_BIT_ALIAS(PKEY_BIT0, HIGH_ARCH_0),
 	DECLARE_VMA_BIT_ALIAS(PKEY_BIT1, HIGH_ARCH_1),
@@ -543,6 +544,7 @@ enum {
 #define VM_DROPPABLE		VM_NONE
 #define VMA_DROPPABLE		EMPTY_VMA_FLAGS
 #endif
+#define VM_ZEROIZE_ON_FREE	INIT_VM_FLAG(ZEROIZE_ON_FREE)
 
 /* Bits set in the VMA until the stack is in its final location */
 #define VM_STACK_INCOMPLETE_SETUP (VM_RAND_READ | VM_SEQ_READ | VM_STACK_EARLY)
@@ -4217,6 +4219,8 @@ extern int __vm_enough_memory(const struct mm_struct *mm, long pages, int cap_sy
 extern void exit_mmap(struct mm_struct *);
 #ifdef CONFIG_MMU
 int mm_set_zeroize_on_free(struct mm_struct *mm, bool enable);
+int mm_mark_zeroize_on_free_range(struct mm_struct *mm,
+				  unsigned long start, unsigned long end);
 void mm_check_zeroize_on_free(struct mm_struct *mm);
 void folio_mark_zeroize_on_free(struct folio *folio,
 			       struct vm_area_struct *vma);

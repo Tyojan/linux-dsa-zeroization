@@ -1406,6 +1406,13 @@ static int madvise_vma_behavior(struct madvise_behavior *madv_behavior)
 			return -EINVAL;
 		new_flags &= ~VM_WIPEONFORK;
 		break;
+	case MADV_ZEROIZE_ON_FREE:
+		/* Scoped zeroization is limited to private anonymous memory. */
+		if (vma->vm_file || new_flags &
+		    (VM_SHARED | VM_PFNMAP | VM_MIXEDMAP | VM_HUGETLB))
+			return -EINVAL;
+		new_flags |= VM_ZEROIZE_ON_FREE;
+		break;
 	case MADV_DONTDUMP:
 		new_flags |= VM_DONTDUMP;
 		break;
@@ -1439,6 +1446,12 @@ static int madvise_vma_behavior(struct madvise_behavior *madv_behavior)
 	VM_WARN_ON_ONCE(madv_behavior->lock_mode != MADVISE_MMAP_WRITE_LOCK);
 
 	error = madvise_update_vma(new_flags, madv_behavior);
+	if (!error && behavior == MADV_ZEROIZE_ON_FREE) {
+		/* Mark resident folios now; future faults are covered by the VMA bit. */
+		WRITE_ONCE(madv_behavior->mm->zeroize_vmas_on_free, true);
+		error = mm_mark_zeroize_on_free_range(madv_behavior->mm,
+				range->start, range->end);
+	}
 out:
 	/*
 	 * madvise() returns EAGAIN if kernel resources, such as
@@ -1554,6 +1567,7 @@ madvise_behavior_valid(int behavior)
 	case MADV_DODUMP:
 	case MADV_WIPEONFORK:
 	case MADV_KEEPONFORK:
+	case MADV_ZEROIZE_ON_FREE:
 	case MADV_GUARD_INSTALL:
 	case MADV_GUARD_REMOVE:
 #ifdef CONFIG_MEMORY_FAILURE

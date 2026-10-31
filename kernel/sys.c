@@ -2532,7 +2532,7 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
 }
 
 /* Apply the mm policy to every live task using it, including existing threads. */
-static void prctl_set_task_struct_zeroize(struct mm_struct *mm)
+static void mm_set_task_struct_zeroize(struct mm_struct *mm)
 {
 	struct task_struct *group, *task;
 	bool enable = READ_ONCE(mm->zeroize_on_free);
@@ -2545,6 +2545,26 @@ static void prctl_set_task_struct_zeroize(struct mm_struct *mm)
 		task_unlock(task);
 	}
 	read_unlock(&tasklist_lock);
+}
+
+/*
+ * Common PRCTL/procfs entry point. The target task's current mm is pinned
+ * before the page walk, so an exiting task is handled safely.
+ */
+int task_set_zeroize_on_free(struct task_struct *task, bool enable)
+{
+	struct mm_struct *mm;
+	int error;
+
+	mm = get_task_mm(task);
+	if (!mm)
+		return -ESRCH;
+
+	error = mm_set_zeroize_on_free(mm, enable);
+	if (!error)
+		mm_set_task_struct_zeroize(mm);
+	mmput(mm);
+	return error;
 }
 
 SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
@@ -2926,8 +2946,7 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 	case PR_SET_ZEROIZE_ON_FREE:
 		if (arg2 > 1 || arg3 || arg4 || arg5 || !me->mm)
 			return -EINVAL;
-		error = mm_set_zeroize_on_free(me->mm, !!arg2);
-		prctl_set_task_struct_zeroize(me->mm);
+		error = task_set_zeroize_on_free(me, !!arg2);
 		break;
 	case PR_GET_ZEROIZE_ON_FREE:
 		if (arg2 || arg3 || arg4 || arg5 || !me->mm)

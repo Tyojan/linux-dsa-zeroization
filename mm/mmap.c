@@ -366,6 +366,13 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	if (flags & MAP_FIXED_NOREPLACE)
 		flags |= MAP_FIXED;
 
+	/* This is intentionally narrower than a generic mmap hint. */
+	if (flags & MAP_ZEROIZE_ON_FREE) {
+		if (file || !(flags & MAP_ANONYMOUS) ||
+		    (flags & MAP_TYPE) != MAP_PRIVATE || (flags & MAP_HUGETLB))
+			return -EINVAL;
+	}
+
 	if (!(flags & MAP_FIXED))
 		addr = round_hint_to_min(addr);
 
@@ -409,6 +416,8 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	vma_flags_set_mask(&vma_flags, mm->def_vma_flags);
 	vma_flags_set(&vma_flags, VMA_MAYREAD_BIT, VMA_MAYWRITE_BIT,
 		      VMA_MAYEXEC_BIT);
+	if (flags & MAP_ZEROIZE_ON_FREE)
+		vma_flags_set(&vma_flags, VMA_ZEROIZE_ON_FREE_BIT);
 
 	/* Obtain the address to map to. we verify (or select) it and ensure
 	 * that it represents a valid section of the address space.
@@ -572,6 +581,8 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	}
 
 	addr = mmap_region(file, addr, len, vma_flags, pgoff, uf);
+	if (!IS_ERR_VALUE(addr) && (flags & MAP_ZEROIZE_ON_FREE))
+		WRITE_ONCE(mm->zeroize_vmas_on_free, true);
 	if (!IS_ERR_VALUE(addr) &&
 	    (vma_flags_test(&vma_flags, VMA_LOCKED_BIT) ||
 	     (flags & (MAP_POPULATE | MAP_NONBLOCK)) == MAP_POPULATE))
@@ -1293,7 +1304,8 @@ void exit_mmap(struct mm_struct *mm)
 	unsigned long nr_accounted = 0;
 	VMA_ITERATOR(vmi, mm, 0);
 	struct unmap_desc unmap;
-	bool przero = READ_ONCE(mm->zeroize_on_free);
+	bool przero = READ_ONCE(mm->zeroize_on_free) ||
+		READ_ONCE(mm->zeroize_vmas_on_free);
 
 	if (trace_przero_lifecycle_enabled())
 		trace_przero_lifecycle(current->pid, current, mm,

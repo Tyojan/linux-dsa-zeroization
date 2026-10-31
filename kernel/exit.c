@@ -564,7 +564,8 @@ static void exit_mm(void)
 	mm_exit_exec_release(current, mm);
 	if (!mm)
 		return;
-	przero = READ_ONCE(mm->zeroize_on_free);
+	przero = READ_ONCE(mm->zeroize_on_free) ||
+		READ_ONCE(mm->zeroize_vmas_on_free);
 	if (trace_przero_lifecycle_enabled())
 		trace_przero_lifecycle(current->pid, current, mm,
 				       PRZERO_EXIT_MM_BEGIN, przero);

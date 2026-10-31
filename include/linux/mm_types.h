@@ -1231,8 +1231,10 @@ struct mm_struct {
 		atomic_long_t pgtables_bytes;	/* size of all page tables */
 #endif
 		int map_count;			/* number of VMAs */
-		/* Mark private anonymous pages for wiping on their final free. */
+		/* Mark all private anonymous pages for wiping on their final free. */
 		bool zeroize_on_free;
+		/* A scoped zeroize VMA existed; drain deferred LRU refs at exit. */
+		bool zeroize_vmas_on_free;
 
 		spinlock_t page_table_lock; /* Protects page tables and some
 					     * counters

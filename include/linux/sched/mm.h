@@ -149,6 +149,7 @@ void mmput_async(struct mm_struct *);
 
 /* Grab a reference to a task's mm, if it is not already going away */
 extern struct mm_struct *get_task_mm(struct task_struct *task);
+int task_set_zeroize_on_free(struct task_struct *task, bool enable);
 /*
  * Grab a reference to a task's mm, if it is not already going away
  * and ptrace_may_access with the mode parameter passed to it

@@ -16,10 +16,16 @@ static bool przero_vma(struct vm_area_struct *vma)
 		!is_vm_hugetlb_page(vma);
 }
 
+static bool przero_vma_enabled(struct vm_area_struct *vma)
+{
+	return READ_ONCE(vma->vm_mm->zeroize_on_free) ||
+		vma_test(vma, VMA_ZEROIZE_ON_FREE_BIT);
+}
+
 static bool przero_mark_folio(struct folio *folio,
 			      struct vm_area_struct *vma)
 {
-	if (unlikely(READ_ONCE(vma->vm_mm->zeroize_on_free)) &&
+	if (unlikely(przero_vma_enabled(vma)) &&
 	    przero_vma(vma) && folio_test_anon(folio) &&
 	    !folio_is_zone_device(folio))
 		return !TestSetPageWantInit(&folio->page);
@@ -42,7 +48,7 @@ struct przero_walk_stats {
 static int przero_test_walk(unsigned long addr, unsigned long end,
 			    struct mm_walk *walk)
 {
-	return !przero_vma(walk->vma);
+	return !przero_vma(walk->vma) || !przero_vma_enabled(walk->vma);
 }
 
 static int przero_mark_walk(unsigned long addr, unsigned long end,
@@ -50,7 +56,7 @@ static int przero_mark_walk(unsigned long addr, unsigned long end,
 {
 	struct przero_walk_stats *stats = walk->private;
 
-	if (!przero_vma(walk->vma))
+	if (!przero_vma(walk->vma) || !przero_vma_enabled(walk->vma))
 		return 1;
 	if (stats)
 		stats->vmas++;
@@ -103,6 +109,13 @@ static const struct mm_walk_ops przero_walk_ops = {
 	.pte_entry = przero_pte_entry,
 	.walk_lock = PGWALK_WRLOCK,
 };
+
+/* The caller serializes VMA changes with mmap_lock in write mode. */
+int mm_mark_zeroize_on_free_range(struct mm_struct *mm,
+				  unsigned long start, unsigned long end)
+{
+	return walk_page_range(mm, start, end, &przero_walk_ops, NULL);
+}
 
 struct przero_check {
 	unsigned long mapped;
@@ -179,7 +192,8 @@ void mm_check_zeroize_on_free(struct mm_struct *mm)
 	struct przero_check check = {};
 	int ret;
 
-	if (!READ_ONCE(mm->zeroize_on_free))
+	if (!READ_ONCE(mm->zeroize_on_free) &&
+	    !READ_ONCE(mm->zeroize_vmas_on_free))
 		return;
 
 	ret = walk_page_range(mm, 0, TASK_SIZE, &przero_check_walk_ops, &check);
@@ -211,13 +225,13 @@ int mm_set_zeroize_on_free(struct mm_struct *mm, bool enable)
 		return -EINTR;
 	WRITE_ONCE(mm->zeroize_on_free, enable);
 	if (enable) {
-		tracing = trace_przero_prctl_walk_enabled();
+		tracing = trace_przero_policy_walk_enabled();
 		if (tracing)
 			start_ns = ktime_get_ns();
 		ret = walk_page_range(mm, 0, TASK_SIZE, &przero_walk_ops,
 				      tracing ? &stats : NULL);
 		if (tracing)
-			trace_przero_prctl_walk(current->pid, mm,
+			trace_przero_policy_walk(current->pid, mm,
 				ktime_get_ns() - start_ns, stats.vmas,
 				stats.ptes, stats.marked_pages, ret);
 	}

@@ -3206,6 +3206,53 @@ static int proc_pid_personality(struct seq_file *m, struct pid_namespace *ns,
 	return err;
 }
 
+/* Root-controlled counterpart of PR_SET/GET_ZEROIZE_ON_FREE. */
+static int proc_pid_zeroize_on_free_show(struct seq_file *m,
+		struct pid_namespace *ns, struct pid *pid,
+		struct task_struct *task)
+{
+	struct mm_struct *mm;
+	int ret = 0;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	mm = get_task_mm(task);
+	if (!mm)
+		return -ESRCH;
+	seq_printf(m, "%d\n", READ_ONCE(mm->zeroize_on_free));
+	mmput(mm);
+	return ret;
+}
+
+static ssize_t proc_pid_zeroize_on_free_write(struct file *file,
+		const char __user *buf, size_t count, loff_t *ppos)
+{
+	struct task_struct *task;
+	bool enable;
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	if (kstrtobool_from_user(buf, count, &enable))
+		return -EINVAL;
+
+	task = get_proc_task(file_inode(file));
+	if (!task)
+		return -ESRCH;
+	ret = task_set_zeroize_on_free(task, enable);
+	put_task_struct(task);
+	return ret ? ret : count;
+}
+
+static const struct file_operations proc_pid_zeroize_on_free_operations = {
+	.open		= proc_single_open,
+	.read		= seq_read,
+	.write		= proc_pid_zeroize_on_free_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
 #ifdef CONFIG_LIVEPATCH
 static int proc_pid_patch_state(struct seq_file *m, struct pid_namespace *ns,
 				struct pid *pid, struct task_struct *task)
@@ -3292,6 +3339,9 @@ static const struct pid_entry tgid_base_stuff[] = {
 	REG("auxv",       S_IRUSR, proc_auxv_operations),
 	ONE("status",     S_IRUGO, proc_pid_status),
 	ONE("personality", S_IRUSR, proc_pid_personality),
+	NOD("zeroize_on_free", S_IFREG|S_IRUSR|S_IWUSR, NULL,
+	    &proc_pid_zeroize_on_free_operations,
+	    { .proc_show = proc_pid_zeroize_on_free_show }),
 	ONE("limits",	  S_IRUGO, proc_pid_limits),
 	REG("sched",      S_IRUGO|S_IWUSR, proc_pid_sched_operations),
 #ifdef CONFIG_SCHED_AUTOGROUP
@@ -3649,6 +3699,9 @@ static const struct pid_entry tid_base_stuff[] = {
 	REG("auxv",      S_IRUSR, proc_auxv_operations),
 	ONE("status",    S_IRUGO, proc_pid_status),
 	ONE("personality", S_IRUSR, proc_pid_personality),
+	NOD("zeroize_on_free", S_IFREG|S_IRUSR|S_IWUSR, NULL,
+	    &proc_pid_zeroize_on_free_operations,
+	    { .proc_show = proc_pid_zeroize_on_free_show }),
 	ONE("limits",	 S_IRUGO, proc_pid_limits),
 	REG("sched",     S_IRUGO|S_IWUSR, proc_pid_sched_operations),
 	NOD("comm",      S_IFREG|S_IRUGO|S_IWUSR,
