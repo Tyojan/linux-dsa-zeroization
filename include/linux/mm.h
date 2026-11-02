@@ -4218,14 +4218,16 @@ void anon_rmap_tree_verify(struct anon_vma_chain *avc);
 extern int __vm_enough_memory(const struct mm_struct *mm, long pages, int cap_sys_admin);
 extern void exit_mmap(struct mm_struct *);
 #ifdef CONFIG_MMU
-int mm_set_zeroize_on_free(struct mm_struct *mm, bool enable);
+int mm_set_zeroize_on_free(struct mm_struct *mm, bool enable,
+			bool update_drain, bool drain);
 int mm_mark_zeroize_on_free_range(struct mm_struct *mm,
 				  unsigned long start, unsigned long end);
 void mm_check_zeroize_on_free(struct mm_struct *mm);
 void folio_mark_zeroize_on_free(struct folio *folio,
 			       struct vm_area_struct *vma);
 #else
-static inline int mm_set_zeroize_on_free(struct mm_struct *mm, bool enable)
+static inline int mm_set_zeroize_on_free(struct mm_struct *mm, bool enable,
+					bool update_drain, bool drain)
 {
 	return -EOPNOTSUPP;
 }

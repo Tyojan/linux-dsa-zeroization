@@ -1444,6 +1444,8 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 	}
 
 	kernel_poison_pages(page, 1 << order);
+	if (requested && trace_przero_page_zero_begin_enabled())
+		trace_przero_page_zero_begin(page_to_pfn(page), 1UL << order);
 	if (requested && trace_przero_page_zero_enabled())
 		zero_start_ns = ktime_get_ns();
 

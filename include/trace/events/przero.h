@@ -17,6 +17,7 @@ enum przero_stage {
 	PRZERO_EXIT_MMAP_BEGIN,
 	PRZERO_LRU_DRAIN_BEGIN,
 	PRZERO_LRU_DRAIN_END,
+	PRZERO_LRU_DRAIN_SKIPPED,
 	PRZERO_EXIT_MMAP_END,
 	PRZERO_EXIT_MM_END,
 	PRZERO_DO_EXIT_END,
@@ -49,6 +50,7 @@ TRACE_EVENT(przero_lifecycle,
 			{ PRZERO_EXIT_MMAP_BEGIN, "exit_mmap_begin" },
 			{ PRZERO_LRU_DRAIN_BEGIN, "lru_drain_begin" },
 			{ PRZERO_LRU_DRAIN_END, "lru_drain_end" },
+			{ PRZERO_LRU_DRAIN_SKIPPED, "lru_drain_skipped" },
 			{ PRZERO_EXIT_MMAP_END, "exit_mmap_end" },
 			{ PRZERO_EXIT_MM_END, "exit_mm_end" },
 			{ PRZERO_DO_EXIT_END, "do_exit_end" }),
@@ -82,6 +84,31 @@ TRACE_EVENT(przero_policy_walk,
 		  __entry->pid, __entry->mm,
 		  (unsigned long long)__entry->duration_ns, __entry->vmas,
 		  __entry->ptes, __entry->marked_pages, __entry->ret)
+);
+
+/* A PFN can be reused, so pair events in chronological order. */
+DECLARE_EVENT_CLASS(przero_page_stage,
+	TP_PROTO(unsigned long pfn, unsigned long pages),
+	TP_ARGS(pfn, pages),
+	TP_STRUCT__entry(
+		__field(unsigned long, pfn)
+		__field(unsigned long, pages)
+	),
+	TP_fast_assign(
+		__entry->pfn = pfn;
+		__entry->pages = pages;
+	),
+	TP_printk("pfn=%#lx pages=%lu", __entry->pfn, __entry->pages)
+);
+
+DEFINE_EVENT(przero_page_stage, przero_page_last_ref,
+	TP_PROTO(unsigned long pfn, unsigned long pages),
+	TP_ARGS(pfn, pages)
+);
+
+DEFINE_EVENT(przero_page_stage, przero_page_zero_begin,
+	TP_PROTO(unsigned long pfn, unsigned long pages),
+	TP_ARGS(pfn, pages)
 );
 
 /* The page can be released on another CPU after the owner has exited. */

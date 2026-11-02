@@ -1351,10 +1351,10 @@ void exit_mmap(struct mm_struct *mm)
 	 * per-CPU LRU batch.  The PTE references above have now been dropped,
 	 * but such a batch reference would defer the final free (and therefore
 	 * PG_want_init zeroization) until an unrelated later LRU drain.  This is
-	 * intentionally a heavy PoC: make PR_SET_ZEROIZE_ON_FREE synchronous with
-	 * respect to those deferred LRU references at final mm teardown.
+	 * When enabled, this intentionally heavy PoC drain brings zeroization of
+	 * pages held by deferred LRU references into final mm teardown.
 	 */
-	if (przero) {
+	if (przero && READ_ONCE(mm->zeroize_lru_drain_on_exit)) {
 		if (trace_przero_lifecycle_enabled())
 			trace_przero_lifecycle(current->pid, current, mm,
 					       PRZERO_LRU_DRAIN_BEGIN, przero);
@@ -1362,6 +1362,9 @@ void exit_mmap(struct mm_struct *mm)
 		if (trace_przero_lifecycle_enabled())
 			trace_przero_lifecycle(current->pid, current, mm,
 					       PRZERO_LRU_DRAIN_END, przero);
+	} else if (przero && trace_przero_lifecycle_enabled()) {
+		trace_przero_lifecycle(current->pid, current, mm,
+				       PRZERO_LRU_DRAIN_SKIPPED, przero);
 	}
 
 	/*

@@ -2551,7 +2551,8 @@ static void mm_set_task_struct_zeroize(struct mm_struct *mm)
  * Common PRCTL/procfs entry point. The target task's current mm is pinned
  * before the page walk, so an exiting task is handled safely.
  */
-int task_set_zeroize_on_free(struct task_struct *task, bool enable)
+int task_set_zeroize_on_free(struct task_struct *task, bool enable,
+			     bool update_drain, bool drain)
 {
 	struct mm_struct *mm;
 	int error;
@@ -2560,7 +2561,7 @@ int task_set_zeroize_on_free(struct task_struct *task, bool enable)
 	if (!mm)
 		return -ESRCH;
 
-	error = mm_set_zeroize_on_free(mm, enable);
+	error = mm_set_zeroize_on_free(mm, enable, update_drain, drain);
 	if (!error)
 		mm_set_task_struct_zeroize(mm);
 	mmput(mm);
@@ -2944,9 +2945,11 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			error = arch_prctl_lock_branch_landing_pad_state(me);
 		break;
 	case PR_SET_ZEROIZE_ON_FREE:
-		if (arg2 > 1 || arg3 || arg4 || arg5 || !me->mm)
+		if (arg2 > 1 || (arg3 & ~PR_ZEROIZE_ON_FREE_NO_LRU_DRAIN) ||
+		    arg4 || arg5 || !me->mm)
 			return -EINVAL;
-		error = task_set_zeroize_on_free(me, !!arg2);
+		error = task_set_zeroize_on_free(me, !!arg2, true,
+					 !(arg3 & PR_ZEROIZE_ON_FREE_NO_LRU_DRAIN));
 		break;
 	case PR_GET_ZEROIZE_ON_FREE:
 		if (arg2 || arg3 || arg4 || arg5 || !me->mm)

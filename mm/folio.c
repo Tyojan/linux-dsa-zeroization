@@ -40,6 +40,14 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/pagemap.h>
+#undef CREATE_TRACE_POINTS
+#include <trace/events/przero.h>
+
+static inline void przero_trace_last_ref(struct folio *folio)
+{
+	if (trace_przero_page_last_ref_enabled() && PageWantInit(&folio->page))
+		trace_przero_page_last_ref(folio_pfn(folio), folio_nr_pages(folio));
+}
 
 struct cpu_fbatches {
 	/*
@@ -90,6 +98,7 @@ static void page_cache_release(struct folio *folio)
 
 void __folio_put(struct folio *folio)
 {
+	przero_trace_last_ref(folio);
 	if (unlikely(folio_is_zone_device(folio))) {
 		free_zone_device_folio(folio);
 		return;
@@ -182,6 +191,7 @@ static void folio_batch_move_lru(struct folio_batch *fbatch, move_fn_t move_fn)
 		 * deferred split list to avoid a dangling list entry.
 		 */
 		if (is_lru_add && folio_ref_freeze(folio, 1)) {
+			przero_trace_last_ref(folio);
 			__folio_clear_active(folio);
 			__folio_clear_unevictable(folio);
 			folio_unqueue_deferred_split(folio);
@@ -1007,6 +1017,7 @@ void folios_put_refs(struct folio_batch *folios, unsigned int *refs)
 
 		if (!folio_ref_sub_and_test(folio, nr_refs))
 			continue;
+		przero_trace_last_ref(folio);
 
 		/* hugetlb has its own memcg */
 		if (folio_test_hugetlb(folio)) {

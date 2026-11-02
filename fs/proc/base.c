@@ -3206,23 +3206,28 @@ static int proc_pid_personality(struct seq_file *m, struct pid_namespace *ns,
 	return err;
 }
 
-/* Root-controlled counterpart of PR_SET/GET_ZEROIZE_ON_FREE. */
+/* Non-dumpable tasks have root-owned proc inodes; check the task's euid. */
+static bool proc_zeroization_may_access(struct task_struct *task)
+{
+	return uid_eq(current_euid(), task_cred_xxx(task, euid)) ||
+	       capable(CAP_SYS_ADMIN);
+}
+
+/* Process-owned counterpart of PR_SET/GET_ZEROIZE_ON_FREE. */
 static int proc_pid_zeroize_on_free_show(struct seq_file *m,
 		struct pid_namespace *ns, struct pid *pid,
 		struct task_struct *task)
 {
 	struct mm_struct *mm;
-	int ret = 0;
 
-	if (!capable(CAP_SYS_ADMIN))
-		return -EPERM;
-
+	if (!proc_zeroization_may_access(task))
+		return -EACCES;
 	mm = get_task_mm(task);
 	if (!mm)
 		return -ESRCH;
 	seq_printf(m, "%d\n", READ_ONCE(mm->zeroize_on_free));
 	mmput(mm);
-	return ret;
+	return 0;
 }
 
 static ssize_t proc_pid_zeroize_on_free_write(struct file *file,
@@ -3232,15 +3237,16 @@ static ssize_t proc_pid_zeroize_on_free_write(struct file *file,
 	bool enable;
 	int ret;
 
-	if (!capable(CAP_SYS_ADMIN))
-		return -EPERM;
 	if (kstrtobool_from_user(buf, count, &enable))
 		return -EINVAL;
 
 	task = get_proc_task(file_inode(file));
 	if (!task)
 		return -ESRCH;
-	ret = task_set_zeroize_on_free(task, enable);
+	if (!proc_zeroization_may_access(task))
+		ret = -EACCES;
+	else
+		ret = task_set_zeroize_on_free(task, enable, false, false);
 	put_task_struct(task);
 	return ret ? ret : count;
 }
@@ -3251,6 +3257,96 @@ static const struct file_operations proc_pid_zeroize_on_free_operations = {
 	.write		= proc_pid_zeroize_on_free_write,
 	.llseek		= seq_lseek,
 	.release	= single_release,
+};
+
+static int proc_pid_zeroize_lru_drain_show(struct seq_file *m,
+		struct pid_namespace *ns, struct pid *pid,
+		struct task_struct *task)
+{
+	struct mm_struct *mm;
+
+	if (!proc_zeroization_may_access(task))
+		return -EACCES;
+	mm = get_task_mm(task);
+	if (!mm)
+		return -ESRCH;
+	seq_printf(m, "%d\n", READ_ONCE(mm->zeroize_lru_drain_on_exit));
+	mmput(mm);
+	return 0;
+}
+
+static ssize_t proc_pid_zeroize_lru_drain_write(struct file *file,
+		const char __user *buf, size_t count, loff_t *ppos)
+{
+	struct task_struct *task;
+	struct mm_struct *mm;
+	bool enable;
+	int ret;
+
+	if (kstrtobool_from_user(buf, count, &enable))
+		return -EINVAL;
+	task = get_proc_task(file_inode(file));
+	if (!task)
+		return -ESRCH;
+	if (!proc_zeroization_may_access(task)) {
+		put_task_struct(task);
+		return -EACCES;
+	}
+	mm = get_task_mm(task);
+	put_task_struct(task);
+	if (!mm)
+		return -ESRCH;
+	ret = mmap_write_lock_killable(mm);
+	if (!ret) {
+		WRITE_ONCE(mm->zeroize_lru_drain_on_exit, enable);
+		mmap_write_unlock(mm);
+	}
+	mmput(mm);
+	return ret ? ret : count;
+}
+
+static const struct file_operations proc_pid_zeroize_lru_drain_operations = {
+	.open		= proc_single_open,
+	.read		= seq_read,
+	.write		= proc_pid_zeroize_lru_drain_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static const struct pid_entry zeroization_dir_stuff[] = {
+	NOD("enable", S_IFREG|S_IRUGO|S_IWUGO, NULL,
+	    &proc_pid_zeroize_on_free_operations,
+	    { .proc_show = proc_pid_zeroize_on_free_show }),
+	NOD("lru_drain", S_IFREG|S_IRUGO|S_IWUGO, NULL,
+	    &proc_pid_zeroize_lru_drain_operations,
+	    { .proc_show = proc_pid_zeroize_lru_drain_show }),
+};
+
+static int proc_zeroization_dir_readdir(struct file *file,
+		struct dir_context *ctx)
+{
+	return proc_pident_readdir(file, ctx, zeroization_dir_stuff,
+				    ARRAY_SIZE(zeroization_dir_stuff));
+}
+
+static const struct file_operations proc_zeroization_dir_operations = {
+	.read		= generic_read_dir,
+	.iterate_shared	= proc_zeroization_dir_readdir,
+	.llseek		= generic_file_llseek,
+};
+
+static struct dentry *proc_zeroization_dir_lookup(struct inode *dir,
+		struct dentry *dentry, unsigned int flags)
+{
+	return proc_pident_lookup(dir, dentry, zeroization_dir_stuff,
+				  zeroization_dir_stuff +
+				  ARRAY_SIZE(zeroization_dir_stuff));
+}
+
+static const struct inode_operations proc_zeroization_dir_inode_operations = {
+	.lookup		= proc_zeroization_dir_lookup,
+	.getattr	= pid_getattr,
+	.setattr	= proc_nochmod_setattr,
 };
 
 #ifdef CONFIG_LIVEPATCH
@@ -3339,9 +3435,9 @@ static const struct pid_entry tgid_base_stuff[] = {
 	REG("auxv",       S_IRUSR, proc_auxv_operations),
 	ONE("status",     S_IRUGO, proc_pid_status),
 	ONE("personality", S_IRUSR, proc_pid_personality),
-	NOD("zeroize_on_free", S_IFREG|S_IRUSR|S_IWUSR, NULL,
-	    &proc_pid_zeroize_on_free_operations,
-	    { .proc_show = proc_pid_zeroize_on_free_show }),
+	DIR("zeroization", S_IRUGO|S_IXUGO,
+	    proc_zeroization_dir_inode_operations,
+	    proc_zeroization_dir_operations),
 	ONE("limits",	  S_IRUGO, proc_pid_limits),
 	REG("sched",      S_IRUGO|S_IWUSR, proc_pid_sched_operations),
 #ifdef CONFIG_SCHED_AUTOGROUP
@@ -3699,9 +3795,9 @@ static const struct pid_entry tid_base_stuff[] = {
 	REG("auxv",      S_IRUSR, proc_auxv_operations),
 	ONE("status",    S_IRUGO, proc_pid_status),
 	ONE("personality", S_IRUSR, proc_pid_personality),
-	NOD("zeroize_on_free", S_IFREG|S_IRUSR|S_IWUSR, NULL,
-	    &proc_pid_zeroize_on_free_operations,
-	    { .proc_show = proc_pid_zeroize_on_free_show }),
+	DIR("zeroization", S_IRUGO|S_IXUGO,
+	    proc_zeroization_dir_inode_operations,
+	    proc_zeroization_dir_operations),
 	ONE("limits",	 S_IRUGO, proc_pid_limits),
 	REG("sched",     S_IRUGO|S_IWUSR, proc_pid_sched_operations),
 	NOD("comm",      S_IFREG|S_IRUGO|S_IWUSR,

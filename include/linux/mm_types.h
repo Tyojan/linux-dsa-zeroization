@@ -1235,6 +1235,8 @@ struct mm_struct {
 		bool zeroize_on_free;
 		/* A scoped zeroize VMA existed; drain deferred LRU refs at exit. */
 		bool zeroize_vmas_on_free;
+		/* Drain deferred LRU references at final mm teardown by default. */
+		bool zeroize_lru_drain_on_exit;
 
 		spinlock_t page_table_lock; /* Protects page tables and some
 					     * counters

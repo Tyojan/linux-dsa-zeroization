@@ -419,4 +419,6 @@ struct prctl_mm_map {
 /* Zeroize memory on process exit */
 #define PR_SET_ZEROIZE_ON_FREE  82
 #define PR_GET_ZEROIZE_ON_FREE  83
+/* Optional arg3 flag for PR_SET_ZEROIZE_ON_FREE. */
+#define PR_ZEROIZE_ON_FREE_NO_LRU_DRAIN (1UL << 0)
 #endif /* _LINUX_PRCTL_H */

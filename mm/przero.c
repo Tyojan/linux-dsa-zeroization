@@ -214,7 +214,8 @@ void mm_check_zeroize_on_free(struct mm_struct *mm)
  * entries are skipped; this PoC does not erase swap storage.
  * Disabling policy never revokes a physical page's existing wipe request.
  */
-int mm_set_zeroize_on_free(struct mm_struct *mm, bool enable)
+int mm_set_zeroize_on_free(struct mm_struct *mm, bool enable,
+			bool update_drain, bool drain)
 {
 	struct przero_walk_stats stats = {};
 	bool tracing;
@@ -223,6 +224,8 @@ int mm_set_zeroize_on_free(struct mm_struct *mm, bool enable)
 
 	if (mmap_write_lock_killable(mm))
 		return -EINTR;
+	if (update_drain)
+		WRITE_ONCE(mm->zeroize_lru_drain_on_exit, drain);
 	WRITE_ONCE(mm->zeroize_on_free, enable);
 	if (enable) {
 		tracing = trace_przero_policy_walk_enabled();
