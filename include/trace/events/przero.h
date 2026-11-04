@@ -57,6 +57,54 @@ TRACE_EVENT(przero_lifecycle,
 		  __entry->zeroize)
 );
 
+/* Global totals at final mm teardown; counters are never reset by tracing. */
+TRACE_EVENT(przero_exit_stats,
+	TP_PROTO(pid_t pid, u64 marked, u64 zeroed),
+	TP_ARGS(pid, marked, zeroed),
+	TP_STRUCT__entry(
+		__field(pid_t, pid)
+		__field(u64, marked)
+		__field(u64, zeroed)
+	),
+	TP_fast_assign(
+		__entry->pid = pid;
+		__entry->marked = marked;
+		__entry->zeroed = zeroed;
+	),
+	TP_printk("pid=%d marked_pages=%llu zeroed_pages=%llu", __entry->pid,
+		  (unsigned long long)__entry->marked,
+		  (unsigned long long)__entry->zeroed)
+);
+
+/* Includes tasklist lock acquisition and per-task lock contention. */
+TRACE_EVENT(przero_task_scan,
+	TP_PROTO(pid_t pid, pid_t target_pid, const void *mm, bool enable,
+		 u64 duration_ns, unsigned long scanned, unsigned long matched),
+	TP_ARGS(pid, target_pid, mm, enable, duration_ns, scanned, matched),
+	TP_STRUCT__entry(
+		__field(pid_t, pid)
+		__field(pid_t, target_pid)
+		__field(const void *, mm)
+		__field(bool, enable)
+		__field(u64, duration_ns)
+		__field(unsigned long, scanned)
+		__field(unsigned long, matched)
+	),
+	TP_fast_assign(
+		__entry->pid = pid;
+		__entry->target_pid = target_pid;
+		__entry->mm = mm;
+		__entry->enable = enable;
+		__entry->duration_ns = duration_ns;
+		__entry->scanned = scanned;
+		__entry->matched = matched;
+	),
+	TP_printk("pid=%d target_pid=%d mm=%p enable=%d duration_ns=%llu scanned=%lu matched=%lu",
+		  __entry->pid, __entry->target_pid, __entry->mm,
+		  __entry->enable, (unsigned long long)__entry->duration_ns,
+		  __entry->scanned, __entry->matched)
+);
+
 TRACE_EVENT(przero_policy_walk,
 	TP_PROTO(pid_t pid, const void *mm, u64 duration_ns,
 		 unsigned long vmas, unsigned long ptes,

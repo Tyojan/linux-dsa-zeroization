@@ -53,6 +53,7 @@
 #include <linux/binfmts.h>
 #include <linux/futex.h>
 #include <linux/rseq.h>
+#include <linux/ktime.h>
 
 #include <linux/sched.h>
 #include <linux/sched/autogroup.h>
@@ -77,6 +78,7 @@
 #include <asm/unistd.h>
 
 #include <trace/events/task.h>
+#include <trace/events/przero.h>
 
 #include "uid16.h"
 
@@ -2532,19 +2534,32 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
 }
 
 /* Apply the mm policy to every live task using it, including existing threads. */
-static void mm_set_task_struct_zeroize(struct mm_struct *mm)
+static void mm_set_task_struct_zeroize(struct mm_struct *mm, pid_t target_pid)
 {
 	struct task_struct *group, *task;
 	bool enable = READ_ONCE(mm->zeroize_on_free);
+	bool tracing = trace_przero_task_scan_enabled();
+	unsigned long scanned = 0, matched = 0;
+	u64 start_ns = 0;
 
+	if (tracing)
+		start_ns = ktime_get_ns();
 	read_lock(&tasklist_lock);
 	for_each_process_thread(group, task) {
+		if (tracing)
+			scanned++;
 		task_lock(task);
-		if (task->mm == mm)
+		if (task->mm == mm) {
 			WRITE_ONCE(task->zeroize_task_struct_on_free, enable);
+			if (tracing)
+				matched++;
+		}
 		task_unlock(task);
 	}
 	read_unlock(&tasklist_lock);
+	if (tracing)
+		trace_przero_task_scan(current->pid, target_pid, mm, enable,
+				       ktime_get_ns() - start_ns, scanned, matched);
 }
 
 /*
@@ -2563,7 +2578,7 @@ int task_set_zeroize_on_free(struct task_struct *task, bool enable,
 
 	error = mm_set_zeroize_on_free(mm, enable, update_drain, drain);
 	if (!error)
-		mm_set_task_struct_zeroize(mm);
+		mm_set_task_struct_zeroize(mm, task_pid_nr(task));
 	mmput(mm);
 	return error;
 }

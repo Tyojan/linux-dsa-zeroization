@@ -14,6 +14,7 @@
  */
 
 #include <linux/migrate.h>
+#include <linux/przero_stats.h>
 #include <linux/export.h>
 #include <linux/swap.h>
 #include <linux/leafops.h>
@@ -777,8 +778,9 @@ void folio_migrate_flags(struct folio *newfolio, struct folio *folio)
 	int cpupid;
 
 	/* Both the old storage and the migrated copy must be wiped on free. */
-	if (PageWantInit(&folio->page))
-		SetPageWantInit(&newfolio->page);
+	if (PageWantInit(&folio->page) &&
+	    !TestSetPageWantInit(&newfolio->page))
+		przero_stats_mark(folio_nr_pages(newfolio));
 
 	if (folio_test_referenced(folio))
 		folio_set_referenced(newfolio);

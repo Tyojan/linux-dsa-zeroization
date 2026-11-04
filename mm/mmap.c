@@ -55,6 +55,7 @@
 #include <asm/mmu_context.h>
 
 #include <trace/events/przero.h>
+#include <linux/przero_stats.h>
 #define CREATE_TRACE_POINTS
 #include <trace/events/mmap.h>
 
@@ -1379,6 +1380,9 @@ destroy:
 	trace_exit_mmap(mm);
 	mmap_write_unlock(mm);
 	vm_unacct_memory(nr_accounted);
+	if (przero && trace_przero_exit_stats_enabled())
+		trace_przero_exit_stats(current->pid, przero_stats_marked(),
+				       przero_stats_zeroed());
 	if (trace_przero_lifecycle_enabled())
 		trace_przero_lifecycle(current->pid, current, mm,
 				       PRZERO_EXIT_MMAP_END, przero);

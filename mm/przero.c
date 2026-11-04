@@ -5,6 +5,7 @@
 #include <linux/pagewalk.h>
 #include <linux/sched.h>
 #include <linux/ktime.h>
+#include <linux/przero_stats.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/przero.h>
@@ -27,8 +28,11 @@ static bool przero_mark_folio(struct folio *folio,
 {
 	if (unlikely(przero_vma_enabled(vma)) &&
 	    przero_vma(vma) && folio_test_anon(folio) &&
-	    !folio_is_zone_device(folio))
-		return !TestSetPageWantInit(&folio->page);
+	    !folio_is_zone_device(folio) &&
+	    !TestSetPageWantInit(&folio->page)) {
+		przero_stats_mark(folio_nr_pages(folio));
+		return true;
+	}
 	return false;
 }
 

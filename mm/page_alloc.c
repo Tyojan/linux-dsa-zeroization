@@ -16,6 +16,7 @@
 
 #include <linux/stddef.h>
 #include <linux/mm.h>
+#include <linux/przero_stats.h>
 #include <linux/highmem.h>
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
@@ -1327,6 +1328,7 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 	 */
 	bool init = want_init_on_free();
 	bool requested = false;
+	unsigned long requested_pages = 0;
 	u64 zero_start_ns = 0;
 	bool compound = PageCompound(page);
 	struct folio *folio = page_folio(page);
@@ -1392,6 +1394,7 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 
 			/* A large folio may have per-subpage init requests. */
 			tail_requested = TestClearPageWantInit(tail_page);
+			requested_pages += tail_requested;
 			requested |= tail_requested;
 			init |= tail_requested;
 
@@ -1426,7 +1429,10 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 		if (bad)
 			return false;
 	}
-	requested |= TestClearPageWantInit(page);
+	if (TestClearPageWantInit(page)) {
+		requested = true;
+		requested_pages = 1UL << order;
+	}
 	init |= requested;
 
 	page_cpupid_reset_last(page);
@@ -1466,6 +1472,8 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 	}
 	if (init)
 		clear_highpages_kasan_tagged(page, 1 << order);
+	if (requested)
+		przero_stats_zero(requested_pages);
 	if (zero_start_ns)
 		trace_przero_page_zero(page_to_pfn(page), 1UL << order,
 				ktime_get_ns() - zero_start_ns);
