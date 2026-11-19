@@ -44,6 +44,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
+#include <linux/przero_stats.h>
 #include <linux/mm_inline.h>
 #include <linux/memblock.h>
 #include <linux/nsproxy.h>
@@ -390,8 +391,47 @@ static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 	return 0;
 }
 
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+/* Call for a live task while task_lock protects its mm, or before publication. */
+void przero_mark_task_stack(struct task_struct *tsk)
+{
+	struct vm_struct *area = tsk->stack_vm_area;
+	unsigned long i, marked = 0;
+
+	if (!area)
+		return;
+	for (i = 0; i < area->nr_pages; i++)
+		if (!TestSetPageWantInit(area->pages[i]))
+			marked++;
+	if (marked)
+		przero_stats_mark(marked);
+}
+
+/* Markers remain sticky if the policy is disabled before stack release. */
+static void przero_clear_task_stack(struct task_struct *tsk)
+{
+	struct vm_struct *area = tsk->stack_vm_area;
+	unsigned long i, marked = 0;
+	bool wipe = READ_ONCE(tsk->zeroize_task_struct_on_free);
+
+	for (i = 0; i < area->nr_pages; i++)
+		wipe |= PageWantInit(area->pages[i]);
+	if (!wipe)
+		return;
+	memzero_explicit(tsk->stack, THREAD_SIZE);
+	for (i = 0; i < area->nr_pages; i++)
+		if (TestClearPageWantInit(area->pages[i]))
+			marked++;
+	if (marked)
+		przero_stats_zero(marked);
+}
+#endif
+
 static void free_thread_stack(struct task_struct *tsk)
 {
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	przero_clear_task_stack(tsk);
+#endif
 	if (!try_release_thread_stack_to_cache(tsk->stack_vm_area))
 		thread_stack_delayed_free(tsk);
 
@@ -530,6 +570,12 @@ static void release_task_stack(struct task_struct *tsk)
 {
 	if (WARN_ON(READ_ONCE(tsk->__state) != TASK_DEAD))
 		return;  /* Better to leak the stack than to free prematurely */
+
+#if defined(CONFIG_THREAD_INFO_IN_TASK) && !defined(CONFIG_VMAP_STACK)
+	/* The dead task no longer uses its stack; wipe it before freeing. */
+	if (READ_ONCE(tsk->zeroize_task_struct_on_free))
+		memzero_explicit(tsk->stack, THREAD_SIZE);
+#endif
 
 	free_thread_stack(tsk);
 }
@@ -948,6 +994,8 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	err = alloc_thread_stack_node(tsk, node);
 	if (err)
 		goto free_tsk;
+	if (READ_ONCE(tsk->zeroize_task_struct_on_free))
+		przero_mark_task_stack(tsk);
 
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	refcount_set(&tsk->stack_refcount, 1);
@@ -1620,6 +1668,8 @@ static int copy_mm(u64 clone_flags, struct task_struct *tsk)
 	tsk->active_mm = mm;
 	WRITE_ONCE(tsk->zeroize_task_struct_on_free,
 		   READ_ONCE(mm->zeroize_on_free));
+	if (READ_ONCE(tsk->zeroize_task_struct_on_free))
+		przero_mark_task_stack(tsk);
 	sched_cache_fork(tsk);
 	return 0;
 }

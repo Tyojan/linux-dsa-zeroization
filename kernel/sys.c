@@ -2551,6 +2551,8 @@ static void mm_set_task_struct_zeroize(struct mm_struct *mm, pid_t target_pid)
 		task_lock(task);
 		if (task->mm == mm) {
 			WRITE_ONCE(task->zeroize_task_struct_on_free, enable);
+			if (enable)
+				przero_mark_task_stack(task);
 			if (tracing)
 				matched++;
 		}

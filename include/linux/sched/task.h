@@ -193,6 +193,12 @@ static inline void arch_thread_struct_whitelist(unsigned long *offset,
 }
 #endif
 
+#if defined(CONFIG_VMAP_STACK) && defined(CONFIG_THREAD_INFO_IN_TASK)
+void przero_mark_task_stack(struct task_struct *tsk);
+#else
+static inline void przero_mark_task_stack(struct task_struct *tsk) { }
+#endif
+
 #ifdef CONFIG_VMAP_STACK
 static inline struct vm_struct *task_stack_vm_area(const struct task_struct *t)
 {
