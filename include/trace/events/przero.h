@@ -177,6 +177,60 @@ TRACE_EVENT(przero_page_zero,
 		  __entry->pages, (unsigned long long)__entry->duration_ns)
 );
 
+/* Stack marking includes page-flag updates and global counter accounting. */
+TRACE_EVENT(przero_kstack_mark,
+	TP_PROTO(pid_t pid, const void *task, unsigned long pages,
+		 unsigned long marked_pages, u64 duration_ns),
+	TP_ARGS(pid, task, pages, marked_pages, duration_ns),
+	TP_STRUCT__entry(
+		__field(pid_t, pid)
+		__field(const void *, task)
+		__field(unsigned long, pages)
+		__field(unsigned long, marked_pages)
+		__field(u64, duration_ns)
+	),
+	TP_fast_assign(
+		__entry->pid = pid;
+		__entry->task = task;
+		__entry->pages = pages;
+		__entry->marked_pages = marked_pages;
+		__entry->duration_ns = duration_ns;
+	),
+	TP_printk("pid=%d task=%p pages=%lu marked_pages=%lu duration_ns=%llu",
+		  __entry->pid, __entry->task, __entry->pages,
+		  __entry->marked_pages, (unsigned long long)__entry->duration_ns)
+);
+
+/* Emitted even when no wipe is requested, to support baseline comparisons. */
+TRACE_EVENT(przero_kstack_release,
+	TP_PROTO(pid_t pid, const void *task, unsigned long pages,
+		 unsigned long marked_pages, bool wiped, u64 duration_ns, u64 wipe_ns),
+	TP_ARGS(pid, task, pages, marked_pages, wiped, duration_ns, wipe_ns),
+	TP_STRUCT__entry(
+		__field(pid_t, pid)
+		__field(const void *, task)
+		__field(unsigned long, pages)
+		__field(unsigned long, marked_pages)
+		__field(bool, wiped)
+		__field(u64, duration_ns)
+		__field(u64, wipe_ns)
+	),
+	TP_fast_assign(
+		__entry->pid = pid;
+		__entry->task = task;
+		__entry->pages = pages;
+		__entry->marked_pages = marked_pages;
+		__entry->wiped = wiped;
+		__entry->duration_ns = duration_ns;
+		__entry->wipe_ns = wipe_ns;
+	),
+	TP_printk("pid=%d task=%p pages=%lu marked_pages=%lu wiped=%d duration_ns=%llu wipe_ns=%llu",
+		  __entry->pid, __entry->task, __entry->pages,
+		  __entry->marked_pages, __entry->wiped,
+		  (unsigned long long)__entry->duration_ns,
+		  (unsigned long long)__entry->wipe_ns)
+);
+
 TRACE_EVENT(przero_task_zero,
 	TP_PROTO(pid_t pid, const void *task, unsigned long bytes, u64 duration_ns),
 	TP_ARGS(pid, task, bytes, duration_ns),

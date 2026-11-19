@@ -397,14 +397,21 @@ void przero_mark_task_stack(struct task_struct *tsk)
 {
 	struct vm_struct *area = tsk->stack_vm_area;
 	unsigned long i, marked = 0;
+	bool tracing = trace_przero_kstack_mark_enabled();
+	u64 start_ns = 0;
 
 	if (!area)
 		return;
+	if (tracing)
+		start_ns = ktime_get_ns();
 	for (i = 0; i < area->nr_pages; i++)
 		if (!TestSetPageWantInit(area->pages[i]))
 			marked++;
 	if (marked)
 		przero_stats_mark(marked);
+	if (tracing)
+		trace_przero_kstack_mark(task_pid_nr(tsk), tsk, area->nr_pages,
+					marked, ktime_get_ns() - start_ns);
 }
 
 /* Markers remain sticky if the policy is disabled before stack release. */
@@ -413,18 +420,31 @@ static void przero_clear_task_stack(struct task_struct *tsk)
 	struct vm_struct *area = tsk->stack_vm_area;
 	unsigned long i, marked = 0;
 	bool wipe = READ_ONCE(tsk->zeroize_task_struct_on_free);
+	bool tracing = trace_przero_kstack_release_enabled();
+	u64 start_ns = 0, wipe_start_ns, wipe_ns = 0;
 
+	if (tracing)
+		start_ns = ktime_get_ns();
 	for (i = 0; i < area->nr_pages; i++)
 		wipe |= PageWantInit(area->pages[i]);
-	if (!wipe)
-		return;
-	memzero_explicit(tsk->stack, THREAD_SIZE);
-	for (i = 0; i < area->nr_pages; i++)
-		if (TestClearPageWantInit(area->pages[i]))
-			marked++;
-	if (marked)
-		przero_stats_zero(marked);
+	if (wipe) {
+		if (tracing)
+			wipe_start_ns = ktime_get_ns();
+		memzero_explicit(tsk->stack, THREAD_SIZE);
+		if (tracing)
+			wipe_ns = ktime_get_ns() - wipe_start_ns;
+		for (i = 0; i < area->nr_pages; i++)
+			if (TestClearPageWantInit(area->pages[i]))
+				marked++;
+		if (marked)
+			przero_stats_zero(marked);
+	}
+	if (tracing)
+		trace_przero_kstack_release(task_pid_nr(tsk), tsk, area->nr_pages,
+					   marked, wipe, ktime_get_ns() - start_ns,
+					   wipe_ns);
 }
+
 #endif
 
 static void free_thread_stack(struct task_struct *tsk)
